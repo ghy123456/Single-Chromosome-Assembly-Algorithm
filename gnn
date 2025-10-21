@@ -1,0 +1,2432 @@
+####models/full_graph.py####
+import torch
+import torch.nn as nn
+
+import dgl
+
+import layers
+
+
+class SymGatedGCNModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_features, hidden_ne_features, num_layers, hidden_edge_scores, normalization, dropout=None):
+        super().__init__()
+        # self.node_encoder = layers.NodeEncoder(node_features, hidden_ne_features, hidden_features)
+        # self.edge_encoder = layers.EdgeEncoder(edge_features, hidden_ne_features, hidden_features)
+        self.linear1_node = nn.Linear(node_features, hidden_ne_features, bias=True)
+        self.linear2_node = nn.Linear(hidden_ne_features, hidden_features, bias=True)
+        self.linear1_edge = nn.Linear(edge_features, hidden_ne_features, bias=True)
+        self.linear2_edge = nn.Linear(hidden_ne_features, hidden_features, bias=True)
+        self.gnn = layers.SymGatedGCN_processor(num_layers, hidden_features, normalization, dropout=dropout)
+        self.predictor = layers.ScorePredictor(hidden_features, hidden_edge_scores)
+        self.relu = nn.ReLU()
+
+    def forward(self, graph, x, e):
+        # x = self.node_encoder(x)
+        # e = self.edge_encoder(e)
+        x = self.linear2_node(self.relu(self.linear1_node(x)))
+        e = self.linear2_edge(self.relu(self.linear1_edge(e)))
+        x, e = self.gnn(graph, x, e)
+        scores = self.predictor(graph, x, e)
+        return scores
+
+
+class GatedGCNModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_features, hidden_ne_features, num_layers, hidden_edge_scores, normalization, dropout=None, directed=True):
+        super().__init__()
+        self.directed = directed
+        self.node_encoder = layers.NodeEncoder(node_features, hidden_ne_features, hidden_features)
+        self.edge_encoder = layers.EdgeEncoder(edge_features, hidden_ne_features, hidden_features)
+        self.gnn = layers.GatedGCN_processor(num_layers, hidden_features, normalization, dropout=dropout)
+        self.predictor = layers.ScorePredictor(hidden_features, hidden_edge_scores)
+
+    def forward(self, graph, x, e):
+        x = self.node_encoder(x)
+        e = self.edge_encoder(e)
+        if self.directed:
+            x, e = self.gnn(graph, x, e)
+        else:
+            g = dgl.add_reverse_edges(graph, copy_edata=True)
+            e = torch.cat((e, e), dim=0)
+            x, e = self.gnn(g, x, e)
+            e = e[:graph.num_edges()]
+        scores = self.predictor(graph, x, e)
+        return scores
+
+
+class GCNModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_features, hidden_ne_features, num_layers, hidden_edge_scores, normalization, dropout=None, directed=True):
+        super().__init__()
+        self.directed = directed
+        self.node_encoder = layers.NodeEncoder(node_features, hidden_ne_features, hidden_features)
+        self.edge_encoder = layers.EdgeEncoder(edge_features, hidden_ne_features, hidden_features)
+        self.gnn = layers.GCN_processor(num_layers, hidden_features)
+        self.predictor = layers.ScorePredictor(hidden_features, hidden_edge_scores)
+
+    def forward(self, graph, x, e):
+        x = self.node_encoder(x)
+        e = self.edge_encoder(e)
+        if self.directed:
+            g = dgl.add_self_loop(graph)
+        else:
+            g = dgl.add_reverse_edges(graph, copy_edata=True)
+            g = dgl.add_self_loop(g)
+        x, e = self.gnn(g, x, e)
+        scores = self.predictor(graph, x, e)
+        return scores
+    
+    
+class GATModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_features, hidden_ne_features, num_layers, hidden_edge_scores, normalization, dropout=None, directed=True):
+        super().__init__()
+        self.directed = directed
+        self.node_encoder = layers.NodeEncoder(node_features, hidden_ne_features, hidden_features)
+        self.edge_encoder = layers.EdgeEncoder(edge_features, hidden_ne_features, hidden_features)
+        self.gnn = layers.GAT_processor(num_layers, hidden_features, dropout=dropout, num_heads=3)
+        self.predictor = layers.ScorePredictor(hidden_features, hidden_edge_scores)
+
+    def forward(self, graph, x, e):       
+        x = self.node_encoder(x)
+        e = self.edge_encoder(e)
+        if self.directed:
+            g = dgl.add_self_loop(graph)
+        else:
+            g = dgl.add_reverse_edges(graph, copy_edata=True)
+            g = dgl.add_self_loop(g)
+        x, e = self.gnn(g, x, e)
+        scores = self.predictor(graph, x, e)
+        return scores
+
+
+class SAGEModel(nn.Module):
+    def __init__(self, node_features, edge_features, hidden_features, hidden_ne_features, num_layers, hidden_edge_scores, normalization, dropout=None, directed=True):
+        super().__init__()
+        self.directed = directed
+        self.node_encoder = layers.NodeEncoder(node_features, hidden_ne_features, hidden_features)
+        self.edge_encoder = layers.EdgeEncoder(edge_features, hidden_ne_features, hidden_features)
+        self.gnn = layers.SAGE_processor(num_layers, hidden_features, dropout=dropout)
+        self.predictor = layers.ScorePredictor(hidden_features, hidden_edge_scores)
+
+    def forward(self, graph, x, e):
+        x = self.node_encoder(x)
+        e = self.edge_encoder(e)
+        if self.directed:
+            g = dgl.add_self_loop(graph)
+        else:
+            g = dgl.add_reverse_edges(graph, copy_edata=True)
+            g = dgl.add_self_loop(g)
+        x, e = self.gnn(g, x, e)
+        scores = self.predictor(graph, x, e)
+        return scores
+####layers/gated_gcn_full.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+
+
+class SymGatedGCN(nn.Module):
+    """
+    Symmetric GatedGCN, based on the idea of  GatedGCN from 'Residual Gated Graph ConvNets'
+    paper by Xavier Bresson and Thomas Laurent, ICLR 2018.
+    https://arxiv.org/pdf/1711.07553v2.pdf
+    """
+    def __init__(self, in_channels, out_channels, normalization, dropout=None, residual=True):
+        super().__init__()
+        if dropout:
+            self.dropout = dropout
+        else:
+            self.dropout = 0.0
+        # print(f'Using dropout: {self.dropout}')
+        self.normalization = normalization
+        self.residual = residual
+
+        if in_channels != out_channels:
+            self.residual = False
+
+        dtype=torch.float32
+
+        self.A_1 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.A_2 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.A_3 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        
+        self.B_1 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.B_2 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.B_3 = nn.Linear(in_channels, out_channels, dtype=dtype)
+
+        if normalization == 'batch':  # batch normalization
+            self.bn_h = nn.BatchNorm1d(out_channels, track_running_stats=True)
+            self.bn_e = nn.BatchNorm1d(out_channels, track_running_stats=True)
+        elif normalization == 'layer':  # layer normalization
+            self.bn_h = nn.LayerNorm(out_channels) 
+            self.bn_e = nn.LayerNorm(out_channels) 
+
+    # def message_forward(self, edges):
+    #     """Message function used on the original graph."""
+    #     A2h_j = edges.src['A2h']
+    #     e_ji = edges.src['B1h'] + edges.dst['B2h'] + edges.data['B3e']  # e_ji = B_1*h_j + B_2*h_i + B_3*e_ji
+    #     if self.normalization != 'none':
+    #         e_ji = self.bn_e(e_ji)
+    #     e_ji = F.relu(e_ji)
+    #     if self.residual:
+    #         e_ji = e_ji + edges.data['e']
+    #     return {'A2h_j': A2h_j, 'e_ji': e_ji}
+
+    # def reduce_forward(self, nodes):
+    #     """Reduce function used on the original graph."""
+    #     A2h_j = nodes.mailbox['A2h_j']
+    #     e_ji = nodes.mailbox['e_ji']
+    #     sigma_ji = torch.sigmoid(e_ji)
+    #     h_forward = torch.sum(sigma_ji * A2h_j, dim=1) / (torch.sum(sigma_ji, dim=1) + 1e-6)
+    #     return {'h_forward': h_forward}
+
+    # def message_backward(self, edges):
+    #     """Message function used on the reverse graph."""
+    #     A3h_k = edges.src['A3h']
+    #     e_ik = edges.dst['B1h'] + edges.src['B2h'] + edges.data['B3e']  # e_ik = B_1*h_i + B_2*h_k + B_3*e_ik
+    #     if self.normalization != 'none':
+    #         e_ik = self.bn_e(e_ik)
+    #     e_ik = F.relu(e_ik)
+    #     if self.residual:
+    #         e_ik = e_ik + edges.data['e']
+    #     return {'A3h_k': A3h_k, 'e_ik': e_ik}
+
+    # def reduce_backward(self, nodes):
+    #     """Reduce function used on the reverse graph."""
+    #     A3h_k = nodes.mailbox['A3h_k']
+    #     e_ik = nodes.mailbox['e_ik']
+    #     sigma_ik = torch.sigmoid(e_ik)
+    #     h_backward = torch.sum(sigma_ik * A3h_k, dim=1) / (torch.sum(sigma_ik, dim=1) + 1e-6)
+    #     return {'h_backward': h_backward}
+
+    def forward(self, g, h, e):
+        """Return updated node representations."""
+        with g.local_scope():
+            h_in = h.clone()
+            e_in = e.clone()
+
+            g.ndata['h'] = h
+            g.edata['e'] = e
+
+            g.ndata['A1h'] = self.A_1(h)
+            g.ndata['A2h'] = self.A_2(h)
+            g.ndata['A3h'] = self.A_3(h)
+
+            g.ndata['B1h'] = self.B_1(h)
+            g.ndata['B2h'] = self.B_2(h)
+            g.edata['B3e'] = self.B_3(e)
+
+            g_reverse = dgl.reverse(g, copy_ndata=True, copy_edata=True)
+
+            # Reference: https://github.com/graphdeeplearning/benchmarking-gnns/blob/master-dgl-0.6/layers/gated_gcn_layer.py
+
+            # Forward-message passing
+            g.apply_edges(fn.u_add_v('B1h', 'B2h', 'B12h'))
+            e_ji = g.edata['B12h'] + g.edata['B3e']
+            e_ji = self.bn_e(e_ji)
+            e_ji = F.relu(e_ji)
+            if self.residual:
+                e_ji = e_ji + e_in
+            g.edata['e_ji'] = e_ji
+            g.edata['sigma_f'] = torch.sigmoid(g.edata['e_ji'])
+            g.update_all(fn.u_mul_e('A2h', 'sigma_f', 'm_f'), fn.sum('m_f', 'sum_sigma_h_f'))
+            g.update_all(fn.copy_e('sigma_f', 'm_f'), fn.sum('m_f', 'sum_sigma_f'))
+            g.ndata['h_forward'] = g.ndata['sum_sigma_h_f'] / (g.ndata['sum_sigma_f'] + 1e-6)
+
+            # Backward-message passing
+            g_reverse.apply_edges(fn.u_add_v('B2h', 'B1h', 'B21h'))
+            e_ik = g_reverse.edata['B21h'] + g_reverse.edata['B3e']
+            e_ik = self.bn_e(e_ik)
+            e_ik = F.relu(e_ik)
+            if self.residual:
+                e_ik = e_ik + e_in
+            g_reverse.edata['e_ik'] = e_ik
+            g_reverse.edata['sigma_b'] = torch.sigmoid(g_reverse.edata['e_ik'])
+            g_reverse.update_all(fn.u_mul_e('A3h', 'sigma_b', 'm_b'), fn.sum('m_b', 'sum_sigma_h_b'))
+            g_reverse.update_all(fn.copy_e('sigma_b', 'm_b'), fn.sum('m_b', 'sum_sigma_b'))
+            g_reverse.ndata['h_backward'] = g_reverse.ndata['sum_sigma_h_b'] / (g_reverse.ndata['sum_sigma_b'] + 1e-6)
+
+            h = g.ndata['A1h'] + g.ndata['h_forward'] + g_reverse.ndata['h_backward']
+
+            if self.normalization != 'none':
+                h = self.bn_h(h)
+
+            h = F.relu(h)
+
+            if self.residual:
+                h = h + h_in
+
+            h = F.dropout(h, self.dropout, training=self.training)
+            e = g.edata['e_ji']
+
+            return h, e
+
+
+class GatedGCN(nn.Module):
+    """
+    GatedGCN layer, idea based on 'Residual Gated Graph ConvNets'
+    paper by Xavier Bresson and Thomas Laurent, ICLR 2018.
+    https://arxiv.org/pdf/1711.07553v2.pdf
+    """
+    def __init__(self, in_channels, out_channels, normalization, dropout=None, residual=True):
+        super().__init__()
+        if dropout:
+            # print(f'Using dropout: {dropout}')
+            self.dropout = dropout
+        else:
+            # print(f'Using dropout: 0.00')
+            self.dropout = 0.0
+        self.normalization = normalization
+        self.residual = residual
+
+        if in_channels != out_channels:
+            self.residual = False
+
+        dtype=torch.float32
+
+        self.A_1 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.A_2 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        # self.A_3 = nn.Linear(in_channels, out_channels, dtype=dtype)  # Not used
+        
+        self.B_1 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.B_2 = nn.Linear(in_channels, out_channels, dtype=dtype)
+        self.B_3 = nn.Linear(in_channels, out_channels, dtype=dtype)
+
+        if normalization == 'batch':  # batch normalization
+            self.bn_h = nn.BatchNorm1d(out_channels, track_running_stats=True)
+            self.bn_e = nn.BatchNorm1d(out_channels, track_running_stats=True)
+        elif normalization == 'layer':  # layer normalization
+            self.bn_h = nn.LayerNorm(out_channels) 
+            self.bn_e = nn.LayerNorm(out_channels) 
+
+    def forward(self, g, h, e):
+        """Return updated node representations."""
+        with g.local_scope():
+            h_in = h.clone()
+            e_in = e.clone()
+            
+            # print(g.num_edges())
+            # print(e.shape)
+
+            g.ndata['h'] = h
+            g.edata['e'] = e
+
+            g.ndata['A1h'] = self.A_1(h)
+            g.ndata['A2h'] = self.A_2(h)
+            # g.ndata['A3h'] = self.A_3(h)
+
+            g.ndata['B1h'] = self.B_1(h)
+            g.ndata['B2h'] = self.B_2(h)
+            g.edata['B3e'] = self.B_3(e)
+
+            # Reference: https://github.com/graphdeeplearning/benchmarking-gnns/blob/master-dgl-0.6/layers/gated_gcn_layer.py
+
+            # Forward-message passing
+            g.apply_edges(fn.u_add_v('B1h', 'B2h', 'B12h'))
+            e_ji = g.edata['B12h'] + g.edata['B3e']
+            e_ji = self.bn_e(e_ji)
+            e_ji = F.relu(e_ji)
+            if self.residual:
+                e_ji = e_ji + e_in
+            g.edata['e_ji'] = e_ji
+            g.edata['sigma_f'] = torch.sigmoid(g.edata['e_ji'])
+            g.update_all(fn.u_mul_e('A2h', 'sigma_f', 'm_f'), fn.sum('m_f', 'sum_sigma_h_f'))
+            g.update_all(fn.copy_e('sigma_f', 'm_f'), fn.sum('m_f', 'sum_sigma_f'))
+            g.ndata['h_forward'] = g.ndata['sum_sigma_h_f'] / (g.ndata['sum_sigma_f'] + 1e-6)
+
+            h = g.ndata['A1h'] + g.ndata['h_forward']
+
+            if self.normalization != 'none':
+                h = self.bn_h(h)
+
+            h = F.relu(h)
+
+            if self.residual:
+                h = h + h_in
+
+            h = F.dropout(h, self.dropout, training=self.training)
+            e = g.edata['e_ji']
+
+            return h, e
+####layers/node_encoder.py####
+
+import torch
+import torch.nn as nn
+
+
+class NodeEncoder(nn.Module):
+    """
+    Module that encodes the node features into a high-dimensional
+    vector.
+
+    Attributes
+    ----------
+    linear : torch.nn.Linear
+        Linear layer used to encode the edge attributes
+    """
+
+    def __init__(self, in_channels, hidden_channels, out_channels, bias=True):
+        """
+        Parameters:
+        in_channels : int
+            Dimension of the input vectors
+        out_channels : int
+            Dimension of the output (encoded) vectors
+        """
+        super().__init__()
+        self.linear1 = nn.Linear(in_channels, hidden_channels, bias=bias)
+        self.linear2 = nn.Linear(hidden_channels, out_channels, bias=bias)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        """Return the encoded node attributes."""
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
+####layers/edge_encoder.py####
+import torch
+import torch.nn as nn
+
+
+class NodeEncoder(nn.Module):
+    """
+    Module that encodes the node features into a high-dimensional
+    vector.
+
+    Attributes
+    ----------
+    linear : torch.nn.Linear
+        Linear layer used to encode the edge attributes
+    """
+
+    def __init__(self, in_channels, hidden_channels, out_channels, bias=True):
+        """
+        Parameters:
+        in_channels : int
+            Dimension of the input vectors
+        out_channels : int
+            Dimension of the output (encoded) vectors
+        """
+        super().__init__()
+        self.linear1 = nn.Linear(in_channels, hidden_channels, bias=bias)
+        self.linear2 = nn.Linear(hidden_channels, out_channels, bias=bias)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        """Return the encoded node attributes."""
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
+####layers/processor.py#####
+from dgl.nn.pytorch.conv import GraphConv, GATConv, SAGEConv
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import layers
+
+
+class SymGatedGCN_processor(nn.Module):
+    def __init__(self, num_layers, hidden_features, normalization, dropout=None):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            layers.SymGatedGCN(hidden_features, hidden_features, normalization, dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, graph, h, e):
+        for i in range(len(self.convs)):
+            h, e = self.convs[i](graph, h, e)
+        return h, e
+
+
+class GatedGCN_processor(nn.Module):
+    def __init__(self, num_layers, hidden_features, normalization, dropout=None):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            layers.GatedGCN(hidden_features, hidden_features, normalization, dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, graph, h, e):
+        for i in range(len(self.convs)):
+            h, e = self.convs[i](graph, h, e)
+        return h, e
+
+
+class GCN_processor(nn.Module):
+    def __init__(self, num_layers, hidden_features):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            GraphConv(hidden_features, hidden_features, weight=True, bias=True) for _ in range(num_layers)
+        ])
+
+    def forward(self, graph, h, e):
+        for i in range(len(self.convs)-1):
+            h = F.relu(self.convs[i](graph, h))
+        h = self.convs[-1](graph, h)
+        return h, e
+    
+
+class GAT_processor(nn.Module):
+    def __init__(self, num_layers, hidden_features, dropout=0.0, num_heads=3):
+        super().__init__()
+        self.num_heads = num_heads
+        print(f'Using dropout:', dropout)
+        self.convs = nn.ModuleList([
+            GATConv(hidden_features, hidden_features, num_heads=self.num_heads, feat_drop=dropout, attn_drop=0) for _ in range(num_layers)
+        ])
+        self.linears = nn.ModuleList([
+            nn.Linear(self.num_heads * hidden_features, hidden_features) for _ in range(num_layers)
+        ])
+
+    def forward(self, graph, h, e):
+        for i in range(len(self.convs)-1):
+            heads = self.convs[i](graph, h)
+            h = torch.cat(tuple(heads[:,j,:] for j in range(self.num_heads)), dim=1)
+            h = self.linears[i](h)
+            h = F.relu(h)
+        heads = self.convs[-1](graph, h)
+        h = torch.cat(tuple(heads[:,j,:] for j in range(self.num_heads)), dim=1)
+        h = self.linears[-1](h)
+        return h, e
+    
+    
+class SAGE_processor(nn.Module):
+    def __init__(self, num_layers, hidden_features, dropout):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            SAGEConv(hidden_features, hidden_features, 'mean', feat_drop=dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, graph, h, e):
+        for i in range(len(self.convs)-1):
+            h = F.relu(self.convs[i](graph, h))
+        h = self.convs[-1](graph, h)
+        return h, e
+####layers/pair_norm.py####
+import torch
+import torch.nn as nn
+
+
+class PairNorm(nn.Module):
+
+    def __init__(self, mode='PN', scale=1.0):
+        super(PairNorm, self).__init__()
+        self.mode = mode
+        self.scale = scale
+
+    def forward(self, x):
+        col_mean = x.mean(dim=0)
+        if self.mode == 'PN':
+            x = x - col_mean
+            rownorm_mean = (1e-6 + x.pow(2).sum(dim=1).mean()).sqrt()
+            x = self.scale * x / rownorm_mean
+        return x
+
+####score_predictor.py####
+import torch
+import torch.nn as nn
+
+
+class ScorePredictor(nn.Module):
+    def __init__(self, in_features, hidden_edge_scores):
+        super().__init__()
+        self.W1 = nn.Linear(3 * in_features, hidden_edge_scores) 
+        self.W2 = nn.Linear(hidden_edge_scores, 32)
+        self.W3 = nn.Linear(32, 1)
+
+    def apply_edges(self, edges)
+        data = torch.cat((edges.src['x'], edges.dst['x'], edges.data['e']), dim=1)
+        h = self.W1(data)
+        h = torch.relu(h)
+        score = self.W3(torch.relu(self.W2(h)))
+        return {'score': score}
+
+    def forward(self, graph, x, e):
+        with graph.local_scope():
+            graph.ndata['x'] = x
+            graph.edata['e'] = e
+            graph.apply_edges(self.apply_edges)
+            return graph.edata['score']
+
+
+
+
+####create_inference_graphs.py####
+import argparse
+import pickle
+import os
+import graph_parser
+import dgl
+
+
+def create_inference_graph(gfa_path, reads_path, out_dir, assembler, paf_path):
+    assert os.path.isfile(gfa_path), "GFA not found!"
+    assert os.path.isfile(reads_path), "Reads not found!"
+
+    print(f'Starting to parse assembler output')
+    graph, auxiliary = graph_parser.only_from_gfa(gfa_path, training=False, reads_path=reads_path, get_similarities=True, paf_path=paf_path)
+    print(f'Parsed assembler output! Saving files...')
+
+    out_dir = os.path.join(out_dir, assembler)
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    processed_dir = f'{out_dir}/processed'
+    info_dir = f'{out_dir}/info'
+    if not os.path.isdir(processed_dir):
+        os.mkdir(processed_dir)
+    if not os.path.isdir(info_dir):
+        os.mkdir(info_dir)
+
+    processed_path = f'{processed_dir}/0.dgl'
+    dgl.save_graphs(processed_path, graph)
+    for name, data in auxiliary.items():
+        pickle.dump(data, open(f'{info_dir}/0_{name}.pkl', 'wb'))
+    print(f'Processing of graph done!\n')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gfa', type=str, help='Path to the GFA graph file')
+    parser.add_argument('--reads', type=str, help='Path to the FASTA/Q reads file')
+    parser.add_argument('--asm', type=str, help='Assembler used')
+    parser.add_argument('--out', type=str, help='Output directory')
+    parser.add_argument('--paf', type=str, help='Path to the PAF file')
+    args = parser.parse_args()
+
+    gfa = args.gfa
+    reads = args.reads
+    out = args.out
+    asm = args.asm
+    paf = args.paf
+    
+    create_inference_graph(gfa, reads, out, asm, paf)
+
+####graph_dataset.py
+import re
+import os
+import pickle
+import subprocess
+
+import dgl
+from dgl.data import DGLDataset
+
+import graph_parser
+from configs.config import get_config
+from utils.data_utils import preprocess_graph, add_positional_encoding, extract_hifiasm_contigs
+
+
+class AssemblyGraphDataset(DGLDataset):
+    def __init__(self, root, assembler, threads=32, generate=False, n_need=0):
+        self.root = os.path.abspath(root)
+        self.assembler = assembler
+        self.threads = threads
+        self.n_need = n_need
+        self.assembly_dir = os.path.join(self.root, self.assembler)
+
+        if 'raw' not in os.listdir(self.root):
+            subprocess.run(f"mkdir 'raw'", shell=True, cwd=self.root)
+        if 'output' not in os.listdir(self.assembly_dir):
+            subprocess.run(f"mkdir 'output'", shell=True, cwd=self.assembly_dir)
+        if f'processed' not in os.listdir(self.assembly_dir):
+            subprocess.run(f"mkdir 'processed'", shell=True, cwd=self.assembly_dir)
+        if f'info' not in os.listdir(self.assembly_dir):
+            subprocess.run(f"mkdir 'info'", shell=True, cwd=self.assembly_dir)
+
+        raw_dir = os.path.join(self.root, 'raw')
+        save_dir = os.path.join(self.assembly_dir, f'processed')
+        self.output_dir = os.path.join(self.assembly_dir, f'output')
+        self.info_dir = os.path.join(self.assembly_dir, f'info')
+        
+        config = get_config()
+        raven_dir = config['raven_dir']
+        self.raven_path = os.path.join(raven_dir, f'build/bin/raven')
+        self.raven_path = os.path.abspath(self.raven_path)
+        hifiasm_dir = config['hifiasm_dir']
+        self.hifiasm_path = os.path.join(hifiasm_dir, f'hifiasm')
+        self.hifiasm_path = os.path.abspath(self.hifiasm_path)
+        
+        super().__init__(name='assembly_graphs', raw_dir=raw_dir, save_dir=save_dir)
+
+        self.graph_list = []
+        if not generate:
+            for file in os.listdir(self.save_dir):
+                idx = int(file[:-4])
+                graph = dgl.load_graphs(os.path.join(self.save_dir, file))[0][0]
+                graph = preprocess_graph(graph)
+                graph = add_positional_encoding(graph)
+                # print(f'DGL graph idx={idx} info:\n',graph)
+                self.graph_list.append((idx, graph))
+            self.graph_list.sort(key=lambda x: x[0])
+            print(f'Number of graphs in the dataset: {len(self.graph_list)}')
+
+    def has_cache(self):
+        """Check if the raw data is already processed and stored."""
+        # raw_files = {int(re.findall(r'(\d+).fast*', raw)[0]) for raw in os.listdir(self.raw_dir)}
+        prc_files = {int(re.findall(r'(\d+).dgl', prc)[0]) for prc in os.listdir(self.save_dir)}
+        needed_files = {i for i in range(self.n_need)}
+        return len(needed_files - prc_files) == 0  # set difference
+
+    def __len__(self):
+        return len(os.listdir(self.save_dir))
+
+    def __getitem__(self, idx):
+        i, graph = self.graph_list[idx]
+        return i, graph
+
+    def process(self):
+        pass
+
+
+class AssemblyGraphDataset_HiFi(AssemblyGraphDataset):
+
+    def __init__(self, root, assembler='hifiasm', threads=1, generate=False, n_need=0):
+        super().__init__(root=root, assembler=assembler, threads=threads, generate=generate, n_need=n_need)
+
+    def process(self):
+        """Process the raw data and save it on the disk."""
+        assembler = 'hifiasm'
+        print(f'hifiasm process')
+        assert assembler in ('raven', 'hifiasm'), 'Choose either "raven" or "hifiasm" assembler'
+
+        graphia_dir = os.path.join(self.assembly_dir, 'graphia')
+        if not os.path.isdir(graphia_dir):
+            os.mkdir(graphia_dir)
+
+        # raw_files = {int(re.findall(r'(\d+).fast*', raw)[0]) for raw in os.listdir(self.raw_dir)}
+        prc_files = {int(re.findall(r'(\d+).dgl', prc)[0]) for prc in os.listdir(self.save_dir)}
+        needed_files = {i for i in range(self.n_need)}
+        diff = sorted(needed_files - prc_files)
+
+        for cnt, idx in enumerate(diff):
+            fastq = f'{idx}.fasta'
+            if fastq not in os.listdir(self.raw_dir):
+                fastq = f'{idx}.fastq'
+            print(f'\nStep {cnt}: generating graphs for reads in {fastq}')
+            reads_path = os.path.abspath(os.path.join(self.raw_dir, fastq))
+            print(f'Path to the reads: {reads_path}')
+            print(f'Using assembler: {assembler}\n')
+            
+            # Raven
+            if assembler == 'raven':
+                subprocess.run(f'{self.raven_path} --disable-checkpoints --identity 0.99 -k29 -w9 -t{self.threads} -p0 {reads_path} > {idx}_assembly.fasta', shell=True, cwd=self.output_dir)
+                subprocess.run(f'mv graph_1.gfa {idx}_raw_graph.gfa', shell=True, cwd=self.output_dir)
+                gfa_path = os.path.join(self.output_dir, f'{idx}_raw_graph.gfa')
+
+            # Hifiasm
+            elif assembler == 'hifiasm':
+                write_paf = False  # TODO: Debugging purposes, remove
+                if write_paf:
+                    subprocess.run(f'{self.hifiasm_path} --prt-raw --write-paf -o {idx}_asm -t{self.threads} -l0 {reads_path}', shell=True, cwd=self.output_dir)
+                    subprocess.run(f'mv {idx}_asm.ovlp.paf {idx}_ovlp.paf', shell=True, cwd=self.output_dir)
+                    paf_path = os.path.join(self.output_dir, f'{idx}_ovlp.paf')
+                else:
+                    subprocess.run(f'{self.hifiasm_path} --prt-raw -o {idx}_asm -t{self.threads} -l0 {reads_path}', shell=True, cwd=self.output_dir)
+                    paf_path = None
+                subprocess.run(f'mv {idx}_asm.bp.raw.r_utg.gfa {idx}_raw_graph.gfa', shell=True, cwd=self.output_dir)
+                gfa_path = os.path.join(self.output_dir, f'{idx}_raw_graph.gfa')
+                extract_hifiasm_contigs(self.output_dir, idx)
+                subprocess.run(f'rm {self.output_dir}/{idx}_asm*', shell=True)
+
+            print(f'\nAssembler generated the graph! Processing...')
+            processed_path = os.path.join(self.save_dir, f'{idx}.dgl')
+            graph, auxiliary = graph_parser.only_from_gfa(gfa_path, reads_path=reads_path, training=True, get_similarities=True, paf_path=paf_path)
+            print(f'Parsed assembler output! Saving files...')
+
+            dgl.save_graphs(processed_path, graph)
+            for name, data in auxiliary.items():
+                pickle.dump(data, open(f'{self.info_dir}/{idx}_{name}.pkl', 'wb'))
+
+            graphia_path = os.path.join(graphia_dir, f'{idx}_graph.txt')
+            graph_parser.print_pairwise(graph, graphia_path)
+            print(f'Processing of graph {idx} generated from {fastq} done!\n')
+
+
+class AssemblyGraphDataset_ONT(AssemblyGraphDataset):
+
+    def __init__(self, root, assembler='raven', threads=1, generate=False, n_need=0):
+        super().__init__(root=root, assembler=assembler, threads=threads, generate=generate, n_need=n_need)
+
+    def process(self):
+        """Process the raw data and save it on the disk."""
+        assembler = 'raven'
+
+        graphia_dir = os.path.join(self.assembly_dir, 'graphia')
+        if not os.path.isdir(graphia_dir):
+            os.mkdir(graphia_dir)
+
+        # raw_files = {int(re.findall(r'(\d+).fast*', raw)[0]) for raw in os.listdir(self.raw_dir)}
+        prc_files = {int(re.findall(r'(\d+).dgl', prc)[0]) for prc in os.listdir(self.save_dir)}
+        needed_files = {i for i in range(self.n_need)}
+        diff = sorted(needed_files - prc_files)
+
+        for cnt, idx in enumerate(diff):
+            fastq = f'{idx}.fasta'
+            if fastq not in os.listdir(self.raw_dir):
+                fastq = f'{idx}.fastq'
+            print(f'\nStep {cnt}: generating graphs for reads in {fastq}')
+            reads_path = os.path.abspath(os.path.join(self.raw_dir, fastq))
+            print(f'Path to the reads: {reads_path}')
+            print(f'Using assembler: {assembler}')
+            print(f'Other assemblers currently unavailable\n')
+            
+            # Raven
+            if assembler == 'raven':
+                subprocess.run(f'{self.raven_path} --disable-checkpoints -t{self.threads} -p0 {reads_path} > {idx}_assembly.fasta', shell=True, cwd=self.output_dir)
+                subprocess.run(f'mv graph_1.csv {idx}_graph_1.csv', shell=True, cwd=self.output_dir)
+                subprocess.run(f'mv graph_1.gfa {idx}_graph_1.gfa', shell=True, cwd=self.output_dir)
+                gfa_path = os.path.join(self.output_dir, f'{idx}_graph_1.gfa')
+
+            print(f'\nAssembler generated the graph! Processing...')
+            processed_path = os.path.join(self.save_dir, f'{idx}.dgl')
+            graph, auxiliary = graph_parser.only_from_gfa(gfa_path, reads_path=reads_path, training=True, get_similarities=True)
+            print(f'Parsed assembler output! Saving files...')
+
+            dgl.save_graphs(processed_path, graph)
+            for name, data in auxiliary.items():
+                pickle.dump(data, open(f'{self.info_dir}/{idx}_{name}.pkl', 'wb'))
+
+            graphia_path = os.path.join(graphia_dir, f'{idx}_graph.txt')
+            graph_parser.print_pairwise(graph, graphia_path)
+            print(f'Processing of graph {idx} generated from {fastq} done!\n')
+
+
+####graph_parser.py
+import gzip
+import re
+from collections import Counter, namedtuple
+from datetime import datetime
+
+from Bio import SeqIO
+from Bio.Seq import Seq
+import dgl
+import networkx as nx
+import edlib
+from tqdm import tqdm
+
+import utils.labels
+
+
+# Overlap = namedtuple('Overlap', ['src_len', 'src_start', 'src_end', 'dst_len', 'dst_start', 'dst_end'])
+
+
+def get_neighbors(graph):
+    """Return neighbors/successors for each node in the graph.
+    
+    Parameters
+    ----------
+    graph : dgl.DGLGraph
+        A DGLGraph for which neighbors will be determined for each
+        node
+
+    Returns
+    -------
+    dict
+        a dictionary where nodes' ordinal numbers are keys and lists
+        with all the nodes' neighbors are values
+    """
+    neighbor_dict = {i.item(): [] for i in graph.nodes()}
+    for src, dst in zip(graph.edges()[0], graph.edges()[1]):
+        neighbor_dict[src.item()].append(dst.item())
+    return neighbor_dict
+
+
+def get_predecessors(graph):
+    """Return predecessors for each node in the graph.
+    
+    Parameters
+    ----------
+    graph : dgl.DGLGraph
+        A DGLGraph for which predecessors will be determined for each
+        node
+
+    Returns
+    -------
+    dict
+        a dictionary where nodes' ordinal numbers are keys and lists
+        with all the nodes' predecessors are values
+    """
+    predecessor_dict = {i.item(): [] for i in graph.nodes()}
+    for src, dst in zip(graph.edges()[0], graph.edges()[1]):
+        predecessor_dict[dst.item()].append(src.item())
+    return predecessor_dict
+
+
+def get_edges(graph):
+    """Return edge index for each edge in the graph.
+
+    Parameters
+    ----------
+    graph : dgl.DGLGraph
+        A DGLGraph for which edge indices will be saved
+
+    Returns
+    -------
+    dict
+        a dictionary where keys are (source, destination) tuples of
+        nodes, and corresponding edge indices are values
+    """
+    edges_dict = {}
+    for idx, (src, dst) in enumerate(zip(graph.edges()[0], graph.edges()[1])):
+        src, dst = src.item(), dst.item()
+        edges_dict[(src, dst)] = idx
+    return edges_dict
+
+
+def print_pairwise(graph, path):
+    """Outputs the graph into a pairwise TXT format.
+    
+    Parameters
+    ----------
+    graph : dgl.DGLGraph
+        The DGLGraph which is saved to the TXT file
+    path : str
+        The location where to save the TXT file
+
+    Returns
+    -------
+    None
+    """
+    with open(path, 'w') as f:
+        for src, dst in zip(graph.edges()[0], graph.edges()[1]):
+            f.write(f'{src}\t{dst}\n')
+
+
+def calculate_similarities(edge_ids, read_seqs, overlap_lengths):
+    # Make sure that read_seqs is a dict of string, not Bio.Seq objects!
+    overlap_similarities = {}
+    zero_ovlp_reads = []
+    for src, dst in tqdm(edge_ids.keys(), ncols=120):
+        ol_length = overlap_lengths[(src, dst)]
+        if ol_length > 0:
+            read_src = read_seqs[src]
+            read_dst = read_seqs[dst]
+            edit_distance = edlib.align(read_src[-ol_length:], read_dst[:ol_length])['editDistance']
+            overlap_similarities[(src, dst)] = 1 - edit_distance / ol_length
+        else:
+            overlap_similarities[(src, dst)] = 0.5
+            zero_ovlp_reads.append((src, dst))
+    if len(zero_ovlp_reads) > 0:
+        print(f'Zero division error occurs for {len(zero_ovlp_reads)} pairs:\t', zero_ovlp_reads)
+    return overlap_similarities
+
+
+def only_from_gfa(gfa_path, training=False, reads_path=None, get_similarities=False, paf_path=None):
+    if training:
+        if reads_path is not None:
+            if reads_path.endswith('gz'):
+                if reads_path.endswith('fasta.gz') or reads_path.endswith('fna.gz') or reads_path.endswith('fa.gz'):
+                    filetype = 'fasta'
+                elif reads_path.endswith('fastq.gz') or reads_path.endswith('fnq.gz') or reads_path.endswith('fq.gz'):
+                    filetype = 'fastq'
+                with gzip.open(reads_path, 'rt') as handle:
+                    read_headers = {read.id: read.description for read in SeqIO.parse(handle, filetype)}
+            else:
+                if reads_path.endswith('fasta') or reads_path.endswith('fna') or reads_path.endswith('fa'):
+                    filetype = 'fasta'
+                elif reads_path.endswith('fastq') or reads_path.endswith('fnq') or reads_path.endswith('fq'):
+                    filetype = 'fastq'
+                read_headers = {read.id: read.description for read in SeqIO.parse(reads_path, filetype)}
+        else:
+            print('You need to pass the reads_path with annotations')
+            exit(1)
+
+    
+    graph_nx = nx.DiGraph()
+
+    read_to_node, node_to_read = {}, {}
+    read_to_node2 = {}
+    read_lengths, read_seqs = {}, {}  # Obtained from the GFA
+    read_strands, read_starts, read_ends, read_chrs = {}, {}, {}, {}  # Obtained from the FASTA/Q headers
+    edge_ids, prefix_lengths, overlap_lengths, overlap_similarities = {}, {}, {}, {}
+
+    no_seqs_flag = False
+
+    time_start = datetime.now()
+    print(f'Starting to loop over GFA')
+    with open(gfa_path) as f:
+        node_idx = 0
+        edge_idx = 0
+
+        # -------------------------------------------------
+        # We assume that the first N lines start with "S"
+        # And next M lines start with "L"
+        # -------------------------------------------------
+        all_lines = f.readlines()
+        line_idx = 0
+        while line_idx < len(all_lines):
+            line = all_lines[line_idx]
+            line_idx += 1
+            line = line.strip().split()
+            if line[0] == 'S':
+                tag, id, sequence, length = line[:4]
+                if sequence == '*':
+                    no_seqs_flag = True
+                sequence = Seq(sequence)  # This sequence is already trimmed in raven!
+                length = int(length[5:])
+
+                real_idx = node_idx
+                virt_idx = node_idx + 1
+                read_to_node[id] = (real_idx, virt_idx)
+                node_to_read[real_idx] = id
+                node_to_read[virt_idx] = id
+
+                graph_nx.add_node(real_idx)  # real node = original sequence
+                graph_nx.add_node(virt_idx)  # virtual node = rev-comp sequence
+
+                read_seqs[real_idx] = str(sequence)
+                read_seqs[virt_idx] = str(sequence.reverse_complement())
+
+                read_lengths[real_idx] = length
+                read_lengths[virt_idx] = length
+
+                if id.startswith('utg'):
+                    # The issue here is that in some cases, one unitig can consist of more than one read
+                    # So this is the adapted version of the code that supports that
+                    # The only things of importance here are read_to_node2 dict (not overly used)
+                    # And id variable which I use for obtaining positions during training (for the labels)
+                    # I don't use it for anything else, which is good
+                    ids = []
+                    while True:
+                        line = all_lines[line_idx]
+                        line = line.strip().split()
+                        if line[0] != 'A':
+                            break
+                        line_idx += 1
+                        tag = line[0]
+                        utg_id = line[1]
+                        read_orientation = line[3]
+                        utg_to_read = line[4]
+                        ids.append((utg_to_read, read_orientation))
+                        read_to_node2[utg_to_read] = (real_idx, virt_idx)
+
+                    id = ids
+                    node_to_read[real_idx] = id
+                    node_to_read[virt_idx] = id
+
+                if training:
+
+                    if type(id) != list:  # TODO: OBSOLETE - see if you can remove it
+                        description = read_headers[id]
+                        # desc_id, strand, start, end = description.split()
+                        strand = re.findall(r'strand=(\+|\-)', description)[0]
+                        strand = 1 if strand == '+' else -1
+                        start = int(re.findall(r'start=(\d+)', description)[0])  # untrimmed
+                        end = int(re.findall(r'end=(\d+)', description)[0])  # untrimmed
+                        chromosome = re.findall(r'chr=([0-9XYM]+)', description)[0]
+                        if chromosome == 'X':
+                            chromosome = -1
+                        elif chromosome == 'Y':
+                            chromosome = -2
+                        elif chromosome == 'M':
+                            chromosome = -3
+                        else:
+                            chromosome = int(chromosome)
+                    else:
+                        strands = []
+                        starts = []
+                        ends = []
+                        chromosomes = []
+                        for id_r, id_o in id:
+                            description = read_headers[id_r]
+                            # desc_id, strand, start, end = description.split()
+                            strand_fasta = re.findall(r'strand=(\+|\-)', description)[0]
+                            strand_fasta = 1 if strand_fasta == '+' else -1
+                            strand_gfa = 1 if id_o == '+' else -1
+                            strand = strand_fasta * strand_gfa
+
+                            strands.append(strand)
+                            start = int(re.findall(r'start=(\d+)', description)[0])  # untrimmed
+                            starts.append(start)
+                            end = int(re.findall(r'end=(\d+)', description)[0])  # untrimmed
+                            ends.append(end)
+                            chromosome = re.findall(r'chr=([0-9XYM]+)', description)[0]
+                            if chromosome == 'X':
+                                chromosome = -1
+                            elif chromosome == 'Y':
+                                chromosome = -2
+                            elif chromosome == 'M':
+                                chromosome = -3
+                            else:
+                                chromosome = int(chromosome)  # Needed for adding these values as node features in DGL graph (useful for debugging, but not essential)
+                            chromosomes.append(chromosome)
+
+                        # What if they come from different strands but are all merged in a single unitig?
+                        # Or even worse, different chromosomes? How do you handle that?
+                        # I don't think you can. It's an error in the graph
+                        strand = 1 if sum(strands) >= 0 else -1
+                        start = min(starts)
+                        end = max(ends)
+                        chromosome = Counter(chromosomes).most_common()[0][0]
+
+                    read_strands[real_idx], read_strands[virt_idx] = strand, -strand
+                    read_starts[real_idx] = read_starts[virt_idx] = start
+                    read_ends[real_idx] = read_ends[virt_idx] = end
+                    read_chrs[real_idx] = read_chrs[virt_idx] = chromosome
+
+                node_idx += 2
+
+            if line[0] == 'L':
+                if len(line) == 6:
+                    # raven, normal GFA 1 standard
+                    tag, id1, orient1, id2, orient2, cigar = line
+                elif len(line) == 7:
+                    # hifiasm GFA
+                    tag, id1, orient1, id2, orient2, cigar, _ = line
+                    id1 = re.findall(r'(.*):\d-\d*', id1)[0]
+                    id2 = re.findall(r'(.*):\d-\d*', id2)[0]
+                elif len(line) == 8:
+                    # hifiasm GFA newer
+                    tag, id1, orient1, id2, orient2, cigar, _, _ = line
+                else:
+                    raise Exception("Unknown GFA format!")
+
+                try:
+                    ol_length = int(cigar[:-1])  # Assumption: this is overlap length and not a CIGAR string
+                except ValueError:
+                    print('Cannot convert CIGAR string into overlap length!')
+                    raise ValueError
+                
+                # In some strange cases this happens
+                if ol_length == 0:
+                    continue
+
+                if orient1 == '+' and orient2 == '+':
+                    src_real = read_to_node[id1][0]
+                    dst_real = read_to_node[id2][0]
+                    src_virt = read_to_node[id2][1]
+                    dst_virt = read_to_node[id1][1]
+                if orient1 == '+' and orient2 == '-':
+                    src_real = read_to_node[id1][0]
+                    dst_real = read_to_node[id2][1]
+                    src_virt = read_to_node[id2][0]
+                    dst_virt = read_to_node[id1][1]
+                if orient1 == '-' and orient2 == '+':
+                    src_real = read_to_node[id1][1]
+                    dst_real = read_to_node[id2][0]
+                    src_virt = read_to_node[id2][1]
+                    dst_virt = read_to_node[id1][0]
+                if orient1 == '-' and orient2 == '-':
+                    src_real = read_to_node[id1][1]
+                    dst_real = read_to_node[id2][1]
+                    src_virt = read_to_node[id2][0]
+                    dst_virt = read_to_node[id1][0]        
+
+                graph_nx.add_edge(src_real, dst_real)
+                graph_nx.add_edge(src_virt, dst_virt)  # In hifiasm GFA this might be redundant, but it is necessary for raven GFA
+
+                edge_ids[(src_real, dst_real)] = edge_idx
+                edge_ids[(src_virt, dst_virt)] = edge_idx + 1
+                edge_idx += 2
+
+                # -----------------------------------------------------------------------------------
+                # This enforces similarity between the edge and its "virtual pair"
+                # Meaning if there is A -> B and B^rc -> A^rc they will have the same overlap_length
+                # When parsing CSV that was not necessarily so:
+                # Sometimes reads would be slightly differently aligned from their RC pairs
+                # Thus resulting in different overlap lengths
+                # -----------------------------------------------------------------------------------
+
+                overlap_lengths[(src_real, dst_real)] = ol_length
+                overlap_lengths[(src_virt, dst_virt)] = ol_length
+
+                prefix_lengths[(src_real, dst_real)] = read_lengths[src_real] - ol_length
+                prefix_lengths[(src_virt, dst_virt)] = read_lengths[src_virt] - ol_length
+                
+    elapsed = (datetime.now() - time_start).seconds
+    print(f'Elapsed time: {elapsed}s')
+    if no_seqs_flag:
+        print(f'Getting sequences from FASTA/Q file...')
+        if reads_path.endswith('gz'):
+            if reads_path.endswith('fasta.gz') or reads_path.endswith('fna.gz') or reads_path.endswith('fa.gz'):
+                filetype = 'fasta'
+            elif reads_path.endswith('fastq.gz') or reads_path.endswith('fnq.gz') or reads_path.endswith('fq.gz'):
+                filetype = 'fastq'
+            with gzip.open(reads_path, 'rt') as handle:
+                fastaq_seqs = {read.id: read.seq for read in SeqIO.parse(handle, filetype)}
+        else:
+            if reads_path.endswith('fasta') or reads_path.endswith('fna') or reads_path.endswith('fa'):
+                filetype = 'fasta'
+            elif reads_path.endswith('fastq') or reads_path.endswith('fnq') or reads_path.endswith('fq'):
+                filetype = 'fastq'
+            fastaq_seqs = {read.id: read.seq for read in SeqIO.parse(reads_path, filetype)}
+
+        print(f'Sequences successfully loaded!')
+        # fastaq_seqs = {read.id: read.seq for read in SeqIO.parse(reads_path, filetype)}
+        for node_id in tqdm(read_seqs.keys(), ncols=120):
+            read_id = node_to_read[node_id]
+            seq = fastaq_seqs[read_id]
+            read_seqs[node_id] = str(seq if node_id % 2 == 0 else seq.reverse_complement())
+        print(f'Loaded DNA sequences!')
+
+    elapsed = (datetime.now() - time_start).seconds
+    print(f'Elapsed time: {elapsed}s')
+
+    if get_similarities:
+        print(f'Calculating similarities...')
+        overlap_similarities = calculate_similarities(edge_ids, read_seqs, overlap_lengths)
+        print(f'Done!')
+        elapsed = (datetime.now() - time_start).seconds
+        print(f'Elapsed time: {elapsed}s')
+
+    nx.set_node_attributes(graph_nx, read_lengths, 'read_length')
+    node_attrs = ['read_length']
+
+    nx.set_edge_attributes(graph_nx, prefix_lengths, 'prefix_length')
+    nx.set_edge_attributes(graph_nx, overlap_lengths, 'overlap_length')
+    edge_attrs = ['prefix_length', 'overlap_length']
+
+    labels = None
+
+    if training:
+        nx.set_node_attributes(graph_nx, read_strands, 'read_strand')
+        nx.set_node_attributes(graph_nx, read_starts, 'read_start')
+        nx.set_node_attributes(graph_nx, read_ends, 'read_end')
+        nx.set_node_attributes(graph_nx, read_chrs, 'read_chr')
+        node_attrs.extend(['read_strand', 'read_start', 'read_end', 'read_chr'])
+
+        unqique_chrs = set(read_chrs.values())
+        if len(unqique_chrs) == 1:
+            ms_pos, labels = utils.labels.process_graph(graph_nx)
+        else:
+            ms_pos, labels = utils.labels.process_graph_combo(graph_nx)
+        nx.set_edge_attributes(graph_nx, labels, 'y')
+        edge_attrs.append('y')
+
+    if get_similarities:
+        nx.set_edge_attributes(graph_nx, overlap_similarities, 'overlap_similarity')
+        edge_attrs.append('overlap_similarity')
+
+    # This produces vector-like features (e.g. shape=(num_nodes,))
+    graph_dgl = dgl.from_networkx(graph_nx, node_attrs=node_attrs, edge_attrs=edge_attrs)
+    
+    predecessors = get_predecessors(graph_dgl)
+    successors = get_neighbors(graph_dgl)
+    edges = get_edges(graph_dgl)
+    
+    if len(read_to_node2) != 0:
+        read_to_node = read_to_node2
+
+    # PAF is currently not used
+    read_paf = False
+    if read_paf and paf_path:
+        # STEP 0:
+        # Parse the PAF file
+        paf = {}
+        with open(paf_path) as f:
+            for line in f.readlines():
+                line = line.strip().split()
+                src, src_len, src_start, src_end = line[:4]
+                strand = line[4]
+                dst, dst_len, dst_start, dst_end = line[5:9]
+                paf[(src, dst)] = (src_len, src_start, src_end, strand, dst_len, dst_start, dst_end)
+
+        # STEP 1:
+        # Iterate over all the edges in the edge list
+        edge_paf_info = {}
+        n2r = node_to_read
+        for src, dst in list(edges.keys()):
+            # Find the reads corresponding to the source/destination nodes (works even for collapsed unitigs)
+            src_r = n2r[src]
+            dst_r = n2r[dst]
+            added = False
+            if len(src_r) == 1 and len(dst_r) == 1:
+                # Clear situation, each node is only one read
+                sr, so = src_r[0]
+                dr, do = dst_r[0]
+                if (sr, dr) in paf:
+                    edge_paf_info[(src, dst)] = paf[sr, dr], (so, do)
+                    added = True
+                else:
+                    # Sometimes, overlaps in PAF are not symmetrical, but readB - readA overlap can be inferred from readA - readB
+                    ovlp = paf[dr, sr]
+                    ovlp = ovlp[4:] + ovlp[3:4] + ovlp[:3]  # Change the source-target overlap information
+                    edge_paf_info[(src, dst)] = ovlp, (so, do)
+                    added = True
+            elif len(src_r) > 1 and len(dst_r) == 1:
+                # Source node is a collapsed unitig, have to inspect which read of the source unitig is used for the overlap
+                dr, do = dst_r[0]
+                for sr, so in src_r:
+                    if added:
+                        break
+                    if (sr, dr) in paf.keys():
+                        edge_paf_info[(src, dst)] = paf[sr, dr], (so, do)
+                        added = True
+                    elif (dr, sr) in paf.keys():
+                        ovlp = paf[dr, sr]
+                        ovlp = ovlp[4:] + ovlp[3:4] + ovlp[:3]
+                        edge_paf_info[(src, dst)] = ovlp, (so, do)
+                        added = True
+                    else:
+                        continue
+            elif len(src_r) == 1 and len(dst_r) > 1:
+                # Destination node is a collapsed unitig, have to inspect which read of the destination unitig is used for the overlap
+                sr, so = src_r[0]
+                for dr, do in dst_r:
+                    if added:
+                        break
+                    if (sr, dr) in paf.keys():
+                        edge_paf_info[(src, dst)] = paf[sr, dr], (so, do)
+                        added = True
+                    elif (dr, sr) in paf.keys():
+                        ovlp = paf[dr, sr]
+                        ovlp = ovlp[4:] + ovlp[3:4] + ovlp[:3]
+                        edge_paf_info[(src, dst)] = ovlp, (so, do)
+                        added = True
+                    else:
+                        continue
+            else:
+                # Both node and destination nodes are collapsed unitigs
+                for sr, so in src_r:
+                    if added:
+                        break
+                    for dr, do in dst_r:
+                        if added:
+                            break
+                        if (sr, dr) in paf.keys():
+                            edge_paf_info[(src, dst)] = paf[sr, dr], (so, do)
+                            added = True
+                        elif (dr, sr) in paf.keys():
+                            ovlp = paf[dr, sr]
+                            ovlp = ovlp[4:] + ovlp[3:4] + ovlp[:3]
+                            edge_paf_info[(src, dst)] = ovlp, (so, do)
+                            added = True
+                        else:
+                            continue
+            assert added, 'Edge not assigned PAF line!'
+
+        # STEP 2
+        # Create new dictionary, edge_paf_info_new, where all the PAF overlaps will be stored in a desirable src->dst format
+        # This can directly be stored as start/end overlap positions for each _node_ and makes computation of overhangs as features simpler
+        edge_paf_info_new = {}
+        for (src, dst), (overlap, (so, do)) in edge_paf_info.items():
+            so = 1 if so == '+' else -1  # source orientation in GFA
+            do = 1 if do == '+' else -1  # destination orientation in GFA
+            ss = 1 if src % 2 == 0 else -1  # source strand in FASTA
+            ds = 1 if dst % 2 == 0 else -1  # destination strand in FASTA
+
+            src_strand = ss * so
+            dst_strand = ds * do
+
+            l1, s1, e1, o, l2, s2, e2 = overlap
+            l1 = int(l1)
+            s1 = int(s1)
+            e1 = int(e1)
+            l2 = int(l2)
+            s2 = int(s2)
+            e2 = int(e2)
+            overlap = (l1, s1, e1, o, l2, s2, e2)
+
+            if src_strand == 1 and dst_strand == 1:
+                # src=+ & dst=+ -> should result in + overlap orientation
+                # The following line was to make sure that the orientations are correct
+                # But it fails in some cases of wrong PAF lines assigned to edges (fixed in Step 3)
+                # assert overlap[3] == '+', f'Breaking for {src} {dst}\n{overlap}'
+                overlap_new = overlap
+            elif src_strand == -1 and dst_strand == 1:
+                # src=- & dst=+ -> should result in - overlap orientation
+                # assert overlap[3] == '-', f'Breaking for {src} {dst}\n{overlap}'
+                length, start, end = overlap[:3]
+                start_new = length - end
+                end_new = length - start
+                overlap_new = (length, start_new, end_new) + overlap[3:]
+            elif src_strand == 1 and dst_strand == -1:
+                # src=+ & dst=- -> should result in - overlap orientation
+                # assert overlap[3] == '-', f'Breaking for {src} {dst}\n{overlap}'
+                length, start, end = overlap[-3:]
+                start_new = length - end
+                end_new = length - start
+                overlap_new = overlap[:-3] + (length, start_new, end_new)
+            else:
+                # src=- & dst=- -> should result in + overlap orientation
+                # assert overlap[3] == '+', f'Breaking for {src} {dst}\n{overlap}'
+                length1, start1, end1 = overlap[:3]
+                length2, start2, end2 = overlap[-3:]
+                sign = overlap[3]
+                start1_new = length1 - end1
+                end1_new = length1 - start1
+                start2_new = length2 - end2
+                end2_new = length2 - start2
+                overlap_new = (length1, start1_new, end1_new, sign, length2, start2_new, end2_new)
+
+            edge_paf_info_new[src, dst] = overlap_new, (so, do)
+
+        # STEP 3:
+        # In some cases PAF lines for readA - readB overlap are not the same as for readB - readA overlap
+        # This results in some edges getting assigned the prefix-suffix overlaps instead of suffix-prefix
+        # This is a "fix" for that problem, though it relies on the sequence lengths and is not perfect
+        # Ideally it would rely only on PAF entries and the graph topology
+        edge_paf_info_new_new = {}
+        for (src, dst), (overlap, (so, do)) in edge_paf_info_new.items():
+            ss = 1 if src % 2 == 0 else -1  # source strand in FASTA
+            ds = 1 if dst % 2 == 0 else -1  # destination strand in FASTA
+            src_strand = ss * so
+            dst_strand = ds * do
+            src_len, src_start, src_end, orientation, dst_len, dst_start, dst_end = overlap
+            if src_end < 0.99 * src_len or dst_start > 0.01 * dst_len:
+                overlap_org, (do_org, so_org) = edge_paf_info_new[dst^1, src^1]
+                src_len2, src_start2, src_end2, orientation2, dst_len2, dst_start2, dst_end2 = overlap_org
+                overlap_new_new = (dst_len2, dst_len2 - dst_end2, dst_len2 - dst_start2, orientation2, src_len2, src_len2 - src_end2, src_len2 - src_start2)
+                # edge_paf_info_new_new[src, dst] = (overlap_new_new, (so, do))
+                # Overlaps are stored as (src_len, src_start, src_end, dst_len, dst_start, dst_end)
+                edge_paf_info_new_new[src, dst] = (overlap_new_new[0], overlap_new_new[1], overlap_new_new[2], overlap_new_new[4], overlap_new_new[5], overlap_new_new[6])
+            else:
+                # edge_paf_info_new_new[src, dst] = (overlap, (so, do))
+                # Overlaps are stored as (src_len, src_start, src_end, dst_len, dst_start, dst_end)
+                edge_paf_info_new_new[src, dst] = (overlap[0], overlap[1], overlap[2], overlap[4], overlap[5], overlap[6])
+        edge_paf_info = edge_paf_info_new_new
+
+    auxiliary = {
+        'pred': predecessors,
+        'succ': successors,
+        'reads': read_seqs,
+        'edges': edges,
+        'read_to_node': read_to_node,
+    }
+
+    if labels is not None:
+        auxiliary['labels'] = labels
+    if 'node_to_read' in locals():
+        auxiliary['node_to_read'] = node_to_read
+    if read_paf and 'edge_paf_info' in locals():
+        auxiliary['edge_paf_info'] = edge_paf_info
+
+    return graph_dgl, auxiliary
+
+
+
+
+#####train.py#####
+import argparse
+from datetime import datetime
+import os
+import random
+import re
+
+import dgl
+import numpy as np
+import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.nn import functional as F
+import wandb
+
+from graph_dataset import AssemblyGraphDataset
+from configs.hyperparameters import get_hyperparameters
+from configs.config import get_config
+import models
+import utils.utils as utils
+import utils.metrics as metrics
+from inference import inference
+
+
+def compute_fp_fn_rates(TP, TN, FP, FN):
+    """Compute False Positive Rate and False Negative Rate, handling division by zero."""
+    fp_rate = FP / (FP + TN) if (FP + TN) != 0 else 0.0
+    fn_rate = FN / (FN + TP) if (FN + TP) != 0 else 0.0
+    return fp_rate, fn_rate
+    
+
+def compute_metrics(logits, labels, loss):
+    """Compute all relevant metrics and store them in epoch lists."""
+    TP, TN, FP, FN = metrics.calculate_tfpn(logits, labels)
+    
+    acc, precision, recall, f1 = metrics.calculate_metrics(TP, TN, FP, FN)
+    acc_inv, precision_inv, recall_inv, f1_inv = metrics.calculate_metrics_inverse(TP, TN, FP, FN)
+    
+    fp_rate, fn_rate = compute_fp_fn_rates(TP, TN, FP, FN)
+
+    # Append metrics to respective lists
+    epoch_metrics_partition = {
+        "loss": loss,
+        "fp_rate": fp_rate,
+        "fn_rate": fn_rate,
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "acc_inv": acc_inv,
+        "precision_inv": precision_inv,
+        "recall_inv": recall_inv,
+        "f1_inv": f1_inv,
+    }
+
+    return epoch_metrics_partition
+
+
+def average_epoch_metrics(metrics_dict):
+    """Compute the mean for each metric across all partitions in an epoch."""
+    return {key: np.mean(values) for key, values in metrics_dict.items()}
+
+
+def save_checkpoint(epoch, model, optimizer, loss_train, loss_valid, out, ckpt_path):
+    checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optim_state_dict': optimizer.state_dict(),
+            'loss_train': loss_train,
+            'loss_valid': loss_valid,
+    }
+    torch.save(checkpoint, ckpt_path)
+
+
+def load_checkpoint(out, model, optimizer):
+    ckpt_path = f'checkpoints/{out}.pt'
+    checkpoint = torch.load(ckpt_path)
+    epoch = checkpoint['epoch']
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optim_state_dict'])
+    loss_train = checkpoint['loss_train']
+    loss_valid = checkpoint['loss_valid']
+    return epoch, model, optimizer, loss_train, loss_valid
+
+
+def view_model_param(model):
+    total_param = 0
+    for param in model.parameters():
+        total_param += np.prod(list(param.data.size()))
+    return total_param
+
+
+def mask_graph_strandwise(g, fraction, device):
+    keep_node_idx_half = torch.rand(g.num_nodes() // 2, device=device) < fraction
+    keep_node_idx = torch.empty(keep_node_idx_half.size(0) * 2, dtype=keep_node_idx_half.dtype)
+    keep_node_idx[0::2] = keep_node_idx_half
+    keep_node_idx[1::2] = keep_node_idx_half
+    sub_g = dgl.node_subgraph(g, keep_node_idx, store_ids=True)
+    print(f'Masking fraction: {fraction}')
+    print(f'Original graph: N={g.num_nodes()}, E={g.num_edges()}')
+    print(f'Subsampled graph: N={sub_g.num_nodes()}, E={sub_g.num_edges()}')
+    return sub_g
+
+
+def symmetry_loss(org_scores, rev_scores, labels, pos_weight=1.0, alpha=1.0):
+    bce_org = F.binary_cross_entropy_with_logits(org_scores, labels, pos_weight=pos_weight, reduction='none')
+    bce_rev = F.binary_cross_entropy_with_logits(rev_scores, labels, pos_weight=pos_weight, reduction='none')
+    abs_diff = torch.abs(org_scores - rev_scores)
+    loss = (bce_org + bce_rev + alpha * abs_diff)
+    loss = loss.mean()
+    return loss
+
+
+def get_full_ne_features(g, reverse=False):
+    pe_in = g.ndata['in_deg'].unsqueeze(1)
+    pe_in = (pe_in - pe_in.mean()) / pe_in.std()
+    pe_out = g.ndata['out_deg'].unsqueeze(1)
+    pe_out = (pe_out - pe_out.mean()) / pe_out.std()
+    if reverse:
+        x = torch.cat((pe_out, pe_in), dim=1)  # Reversed edges, in/out-deg also reversed
+    else:
+        x = torch.cat((pe_in, pe_out), dim=1)
+    e = g.edata['e']
+    return x, e
+
+
+def get_partition_ne_features(sub_g, g, reverse=False):
+    pe_in = g.ndata['in_deg'][sub_g.ndata['_ID']].unsqueeze(1)
+    pe_in = (pe_in - pe_in.mean()) / pe_in.std()
+    pe_out = g.ndata['out_deg'][sub_g.ndata['_ID']].unsqueeze(1)
+    pe_out = (pe_out - pe_out.mean()) / pe_out.std()
+    if reverse:
+        x = torch.cat((pe_out, pe_in), dim=1)  # Reversed edges, in/out-deg also reversed
+    else:
+        x = torch.cat((pe_in, pe_out), dim=1)
+    e = g.edata['e'][sub_g.edata['_ID']]
+    return x, e
+
+
+def get_bce_loss_full(g, model, pos_weight, device):
+    x, e = get_full_ne_features(g, reverse=False)
+    x, e = x.to(device), e.to(device)
+    logits = model(g, x, e)
+    logits = logits.squeeze(-1)
+    labels = g.edata['y'].to(device)
+    loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+    return loss, logits
+
+
+def get_bce_loss_partition(sub_g, g, model, pos_weight, device):
+    sub_g = sub_g.to(device)
+    x, e = get_partition_ne_features(sub_g, g, reverse=False)
+    x, e = x.to(device), e.to(device)
+    logits = model(sub_g, x, e) 
+    logits = logits.squeeze(-1)
+    labels = g.edata['y'][sub_g.edata['_ID']].to(device)
+    loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+    return loss, logits
+
+
+def get_symmetry_loss_full(g, model, pos_weight, alpha, device):
+    x, e = get_full_ne_features(g, reverse=False)
+    x, e = x.to(device), e.to(device)
+    logits_org = model(g, x, e).squeeze(-1)
+    labels = g.edata['y'].to(device)
+    
+    g = dgl.reverse(g, True, True)
+    x, e = get_full_ne_features(g, reverse=True)
+    x, e = x.to(device), e.to(device)
+    logits_rev = model(g, x, e).squeeze(-1)
+    loss = symmetry_loss(logits_org, logits_rev, labels, pos_weight, alpha=alpha)
+    return loss, logits_org
+
+
+def get_symmetry_loss_partition(sub_g, g, model, pos_weight, alpha, device):
+    sub_g = sub_g.to(device)
+    x, e = get_partition_ne_features(sub_g, g, False)
+    x, e = x.to(device), e.to(device)
+    logits_org = model(sub_g, x, e).squeeze(-1)
+    labels = g.edata['y'][sub_g.edata['_ID']].to(device)
+    
+    sub_g = dgl.reverse(sub_g, True, True)
+    x, e = get_partition_ne_features(sub_g, g, True)
+    x, e = x.to(device), e.to(device)
+    logits_rev = model(sub_g, x, e).squeeze(-1)
+    loss = symmetry_loss(logits_org, logits_rev, labels, pos_weight, alpha=alpha)
+    return loss, logits_org
+
+
+def train(train_path, valid_path, out, assembler, overfit=False, dropout=None, seed=None, resume=False, gpu=None):
+    hyperparameters = get_hyperparameters()
+    if seed is None:
+        seed = hyperparameters['seed']
+    num_epochs = hyperparameters['num_epochs']
+    num_gnn_layers = hyperparameters['num_gnn_layers']
+    hidden_features = hyperparameters['dim_latent']
+    patience = hyperparameters['patience']
+    lr = hyperparameters['lr']
+    device = hyperparameters['device']
+    normalization = hyperparameters['normalization']
+    node_features = hyperparameters['node_features']
+    edge_features = hyperparameters['edge_features']
+    hidden_ne_features = hyperparameters['hidden_ne_features']
+    hidden_edge_scores = hyperparameters['hidden_edge_scores']
+    decay = hyperparameters['decay']
+    wandb_mode = hyperparameters['wandb_mode']
+    wandb_project = hyperparameters['wandb_project']
+    num_nodes_per_cluster = hyperparameters['num_nodes_per_cluster']
+    k_extra_hops = hyperparameters['k_extra_hops']
+    masking = hyperparameters['masking']
+    mask_frac_low = hyperparameters['mask_frac_low']
+    mask_frac_high = hyperparameters['mask_frac_high']
+    use_symmetry_loss = hyperparameters['use_symmetry_loss']
+    alpha = hyperparameters['alpha']
+
+    config = get_config()
+    checkpoints_path = os.path.abspath(config['checkpoints_path'])
+    models_path = os.path.abspath(config['models_path'])
+    
+    if gpu:
+        # GPU as an argument to the train.py script
+        # Otherwise, take the device from hyperparameters.py
+        device = f'cuda:{gpu}'
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+    else:
+        device = 'cpu'
+
+    utils.set_seed(seed)
+    
+    time_start = datetime.now()
+    timestamp = time_start.strftime('%Y-%b-%d-%H-%M-%S')
+    
+    if out is None:
+        out = timestamp
+    assert train_path is not None, "train_path not specified!"
+    assert valid_path is not None, "valid_path not specified!"
+
+    if not overfit:
+        ds_train = AssemblyGraphDataset(train_path, assembler=assembler)
+        ds_valid = AssemblyGraphDataset(valid_path, assembler=assembler)
+    else:
+        ds_train = ds_valid = AssemblyGraphDataset(train_path, assembler=assembler)
+
+    if dropout is None:
+        dropout = hyperparameters['dropout']
+
+    pos_to_neg_ratio = sum([((torch.round(g.edata['y'])==1).sum() / (torch.round(g.edata['y'])==0).sum()).item() for _, g in ds_train]) / len(ds_train)
+
+    model = models.SymGatedGCNModel(node_features, edge_features, hidden_features, hidden_ne_features, num_gnn_layers, hidden_edge_scores, normalization, dropout=dropout)
+    model.to(device)
+    if not os.path.exists(models_path):
+        print(models_path)
+        os.makedirs(models_path)
+
+    out = out + f'_seed{seed}'
+    model_path = os.path.join(models_path, f'model_{out}.pt')    
+    ckpt_path = f'{checkpoints_path}/ckpt_{out}.pt'
+
+    pos_weight = torch.tensor([1 / pos_to_neg_ratio], device=device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=decay, patience=patience, verbose=True)
+    start_epoch = 0
+
+    loss_per_epoch_train, loss_per_epoch_valid = [], []
+
+    if not os.path.exists(checkpoints_path):
+        os.makedirs(checkpoints_path)
+
+    print(f'----- TRAIN CONFIGURAION SUMMARY -----')
+    print(f'Using device: {device}')
+    print(f'Using seed: {seed}')
+    print(f'Model path: {model_path}')
+    print(f'Checkpoint path: {ckpt_path}')
+    print(f'Number of network parameters: {view_model_param(model)}')
+    print(f'Normalization type : {normalization}')
+    print(f'--------------------------------------\n')
+    
+    if resume:
+        # ckpt_path = f'{checkpoints_path}/ckpt_{out}.pt'  # This should be the checkpoint of the old run
+        checkpoint = torch.load(ckpt_path)
+        print('Loding the checkpoint from:', ckpt_path, sep='\t')
+        model_path = os.path.join(models_path, f'model_{out}_resumed-{num_epochs}.pt')
+        ckpt_path  = os.path.join(checkpoints_path, f'ckpt_{out}_resumed-{num_epochs}.pt')
+        print('Saving the resumed model to:', model_path, sep='\t')
+        print('Saving the new checkpoint to:', ckpt_path, sep='\t')
+        
+        start_epoch = checkpoint['epoch'] + 1
+        print(f'Resuming from epoch: {start_epoch}')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optim_state_dict'])
+        
+        min_loss_train = checkpoint['loss_train']
+        min_loss_valid = checkpoint['loss_valid']
+        loss_per_epoch_train.append(min_loss_train)
+        loss_per_epoch_valid.append(min_loss_valid)
+        
+    elapsed = utils.timedelta_to_str(datetime.now() - time_start)
+    print(f'Loading data done. Elapsed time: {elapsed}')
+
+    try:
+        with wandb.init(project=wandb_project, config=hyperparameters, mode=wandb_mode, name=out):
+            # wandb.watch(model, log='all', log_freq=2)
+            for epoch in range(start_epoch, num_epochs):
+                print('\n===> TRAINING')
+                epoch_metrics_list_train = []
+                random.shuffle(ds_train.graph_list)
+                for data in ds_train:
+                    model.train()
+                    idx, g = data
+
+                    print(f'\n(TRAIN: Epoch = {epoch:3}) NEW GRAPH: index = {idx}')
+                    if masking:
+                        fraction = random.randint(mask_frac_low, mask_frac_high) / 100  # Fraction of nodes to be left in the graph (.85 -> ~30x, 1.0 -> 60x)
+                        g = mask_graph_strandwise(g, fraction, device)
+
+                    # Determine whether to partition or not
+                    num_nodes_for_g = num_nodes_per_cluster
+                    num_clusters = g.num_nodes() // num_nodes_per_cluster + 1
+
+                    if num_nodes_for_g >= g.num_nodes(): # train with full graph
+                        print(f'\nUse METIS: False')
+                        print(f'Use full graph')
+                        g = g.to(device)
+                        if use_symmetry_loss:
+                            loss, logits = get_symmetry_loss_full(g, model, pos_weight, alpha, device)
+                        else:
+                            loss, logits = get_bce_loss_full(g, model, pos_weight, device)
+                        labels = g.edata['y'].to(device)
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        epoch_metrics_list_train.append(compute_metrics(logits, labels, loss.item()))  # Append with a dict for each graph in the dataset
+                    else: # train with mini-batch
+                        print(f'\nUse METIS: True')
+                        print(f'Number of clusters:', num_clusters)
+                        d = dgl.metis_partition(g.long(), num_clusters, extra_cached_hops=k_extra_hops)
+                        sub_gs = list(d.values())
+                        random.shuffle(sub_gs)
+
+                        for sub_g in sub_gs:
+                            if use_symmetry_loss:
+                                loss, logits = get_symmetry_loss_partition(sub_g, g, model, pos_weight, alpha, device)
+                            else:
+                                loss, logits = get_bce_loss_partition(sub_g, g, model, pos_weight, device)
+                            labels = g.edata['y'][sub_g.edata['_ID']].to(device)
+                            optimizer.zero_grad()
+                            loss.backward()
+                            optimizer.step()
+                            epoch_metrics_list_train.append(compute_metrics(logits, labels, loss.item()))  # Append with a dict for each partition in the dataset
+                            
+                aggregated_metrics = {key: [metrics[key] for metrics in epoch_metrics_list_train] for key in epoch_metrics_list_train[0]}  # Iterate over the metrics
+                epoch_mean_metrics_train = average_epoch_metrics(aggregated_metrics)  # Average over the partitions / full graphs
+
+                train_loss_epoch = epoch_mean_metrics_train["loss"]
+                train_fp_rate_epoch = epoch_mean_metrics_train["fp_rate"]
+                train_fn_rate_epoch = epoch_mean_metrics_train["fn_rate"]
+                train_f1_epoch = epoch_mean_metrics_train["f1"]
+                train_f1_inv_epoch = epoch_mean_metrics_train["f1_inv"]
+                loss_per_epoch_train.append(train_loss_epoch)
+                lr_value = optimizer.param_groups[0]['lr']
+
+                if overfit:
+                    if len(loss_per_epoch_valid) == 1 or loss_per_epoch_train[-1] < min(loss_per_epoch_train[:-1]):
+                        torch.save(model.state_dict(), model_path)
+                        print(f'\nEpoch {epoch:3}: Model saved (overfitting)! -> Train Loss = {train_loss_epoch:.6f}' \
+                              f'\nTrain  F1 = {train_f1_epoch:.4f}\tTrain inv-F1 = {train_f1_inv_epoch:.4f}' \
+                              f'\nTrain FPR = {train_fp_rate_epoch:.4f}\tTrain FNR = {train_fn_rate_epoch:.4f}\n')
+                    save_checkpoint(epoch, model, optimizer, min(loss_per_epoch_train), 0.0, out, ckpt_path)
+                    scheduler.step(train_loss_epoch)
+                    log_data = {f"train/{key}": value for key, value in epoch_mean_metrics_train.items()}
+                    log_data['lr_value'] = lr_value
+                    wandb.log(log_data)
+                    continue  # This will entirely skip the validation
+
+                with torch.no_grad():
+                    print('\n===> VALIDATION')
+                    # time_start_eval = datetime.now()
+                    epoch_metrics_list_valid = []
+                    model.eval()
+                    for data in ds_valid:
+                        idx, g = data
+
+                        print(f'\n(VALID Epoch = {epoch:3}) NEW GRAPH: index = {idx}')
+                        if masking:
+                            fraction = random.randint(mask_frac_low, mask_frac_high) / 100  # Fraction of nodes to be left in the graph (.85 -> ~30x, 1.0 -> 60x)
+                            g = mask_graph_strandwise(g, fraction, device)
+                        
+                        # Determine whether to partition or not
+                        num_nodes_for_g = num_nodes_per_cluster
+                        num_clusters = g.num_nodes() // num_nodes_for_g + 1
+                        
+                        if num_nodes_for_g >= g.num_nodes(): # full graph
+                            print(f'\nUse METIS: False')
+                            print(f'Use full graph')
+                            g = g.to(device)
+                            if use_symmetry_loss:
+                                loss, logits = get_symmetry_loss_full(g, model, pos_weight, alpha, device)
+                            else:
+                                loss, logits = get_bce_loss_full(g, model, pos_weight, device)
+                            labels = g.edata['y'].to(device)
+                            epoch_metrics_list_valid.append(compute_metrics(logits, labels, loss.item()))  # Append with a dict for each graph in the dataset
+                        else: # mini-batch
+                            print(f'\nUse METIS: True')
+                            print(f'\nNum clusters:', num_clusters)
+                            d = dgl.metis_partition(g.long(), num_clusters, extra_cached_hops=k_extra_hops)
+                            sub_gs = list(d.values())
+                            for sub_g in sub_gs:
+                                if use_symmetry_loss:
+                                    loss, logits = get_symmetry_loss_partition(sub_g, g, model, pos_weight, alpha, device)
+                                else:
+                                    loss, logits = get_bce_loss_partition(sub_g, g, model, pos_weight, device)
+                                labels = g.edata['y'][sub_g.edata['_ID']].to(device)
+                                epoch_metrics_list_valid.append(compute_metrics(logits, labels, loss.item()))  # Append with a dict for each partition in the dataset
+                    
+                    aggregated_metrics = {key: [metrics[key] for metrics in epoch_metrics_list_valid] for key in epoch_metrics_list_valid[0]}  # Iterate over the metrics
+                    epoch_mean_metrics_valid = average_epoch_metrics(aggregated_metrics)  # Average over the partitions / full graphs
+
+                    valid_loss_epoch = epoch_mean_metrics_valid["loss"]
+                    valid_fp_rate_epoch = epoch_mean_metrics_valid["fp_rate"]
+                    valid_fn_rate_epoch = epoch_mean_metrics_valid["fn_rate"]
+                    valid_f1_epoch = epoch_mean_metrics_valid["f1"]
+                    valid_f1_inv_epoch = epoch_mean_metrics_valid["f1_inv"]
+                    loss_per_epoch_valid.append(epoch_mean_metrics_valid["loss"])
+
+                    if not overfit:
+                        # Choose the model with minimal loss on validation set
+                        if len(loss_per_epoch_valid) == 1 or loss_per_epoch_valid[-1] < min(loss_per_epoch_valid[:-1]):
+                            torch.save(model.state_dict(), model_path)
+                            print(f'\nEpoch {epoch:3}: Model saved! -> Val Loss = {valid_loss_epoch:.6f}' \
+                                  f'\nVal  F1 = {valid_f1_epoch:.4f}\tVal inv-F1 = {valid_f1_inv_epoch:.4f}' \
+                                  f'\nVal FPR = {valid_fp_rate_epoch:.4f}\tVal FNR = {valid_fn_rate_epoch:.4f}\n')
+                        save_checkpoint(epoch, model, optimizer, min(loss_per_epoch_train), min(loss_per_epoch_valid), out, ckpt_path)  # Save the checkpoint every epoch
+                        scheduler.step(valid_loss_epoch)
+
+                    # Code that evalates NGA50 during training -- only for overfitting
+                    # plot_nga50_during_training = hyperparameters['plot_nga50_during_training']
+                    # i = hyperparameters['chr_overfit']
+                    # eval_frequency = hyperparameters['eval_frequency']
+                    # if overfit and plot_nga50_during_training and (epoch+1) % eval_frequency == 0:
+                    #     # call inference
+                    #     refs_path = hyperparameters['refs_path']
+                    #     save_dir = os.path.join(train_path, assembler)
+                    #     if not os.path.isdir(save_dir):
+                    #         os.makedirs(save_dir)
+                    #     if not os.path.isdir(os.path.join(save_dir, f'assembly')):
+                    #         os.mkdir(os.path.join(save_dir, f'assembly'))
+                    #     if not os.path.isdir(os.path.join(save_dir, f'inference')):
+                    #         os.mkdir(os.path.join(save_dir, f'inference'))
+                    #     if not os.path.isdir(os.path.join(save_dir, f'reports')):
+                    #         os.mkdir(os.path.join(save_dir, f'reports'))
+                    #     inference(train_path, model_path, assembler, save_dir)
+                    #     # call evaluate
+                    #     ref = os.path.join(refs_path, 'chromosomes', f'chr{i}.fasta')
+                    #     idx = os.path.join(refs_path, 'indexed', f'chr{i}.fasta.fai')
+                    #     asm = os.path.join(save_dir, f'assembly', f'0_assembly.fasta')
+                    #     report = os.path.join(save_dir, f'reports', '0_minigraph.txt')
+                    #     paf = os.path.join(save_dir, f'asm.paf')
+                    #     p = evaluate.run_minigraph(ref, asm, paf)
+                    #     p.wait()
+                    #     p = evaluate.parse_pafs(idx, report, paf)
+                    #     p.wait()
+                    #     with open(report) as f:
+                    #         text = f.read()
+                    #         ng50 = int(re.findall(r'NG50\s*(\d+)', text)[0])
+                    #         nga50 = int(re.findall(r'NGA50\s*(\d+)', text)[0])
+                    #         print(f'NG50: {ng50}\tNGA50: {nga50}')
+
+                try:
+                    # Log training metrics
+                    log_data = {f"train/{key}": value for key, value in epoch_mean_metrics_train.items()}
+
+                    # Log validation metrics if available
+                    if "epoch_mean_metrics_valid" in locals():  # Ensure validation metrics exist
+                        log_data.update({f"valid/{key}": value for key, value in epoch_mean_metrics_valid.items()})
+
+                    # Log reconstruction metrics if available
+                    # if 'nga50' in locals():
+                    #     log_data['reconstruct/ng50': ng50]
+                    #     log_data['reconstruct/nga50': nga50]
+                        
+                    # Log additional information
+                    log_data['lr_value'] = lr_value
+                    wandb.log(log_data)
+
+                except Exception as e:
+                    print(f'WandB exception occured!')
+                    print(e)
+
+    except KeyboardInterrupt:
+        torch.cuda.empty_cache()
+        print("Keyboard Interrupt...")
+        print("Exiting...")
+
+    finally:
+        torch.cuda.empty_cache()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', type=str, help='Path to the dataset')
+    parser.add_argument('--valid', type=str, help='Path to the dataset')
+    parser.add_argument('--asm', type=str, help='Assembler used')
+    parser.add_argument('--name', type=str, default=None, help='Name for the model')
+    parser.add_argument('--overfit', action='store_true', help='Overfit on the training data')
+    parser.add_argument('--resume', action='store_true', help='Resume in case training failed')
+    parser.add_argument('--dropout', type=float, default=None, help='Dropout rate for the model')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed')
+    parser.add_argument('--gpu', type=int, default=None, help='Index of a GPU to train on (unspecified = cpu)')
+    # parser.add_argument('--savedir', type=str, default=None, help='Directory to save the model and the checkpoints')
+
+#####inference.py#####
+import argparse
+import os
+import sys
+import pickle
+import random
+import math
+from tqdm import tqdm 
+import collections
+import time
+import psutil
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from multiprocessing import Manager
+
+import torch
+import torch.nn.functional as F
+import dgl
+
+from graph_dataset import AssemblyGraphDataset
+from configs.hyperparameters import get_hyperparameters
+import models
+import utils.evaluate as evaluate
+import utils.utils as utils
+
+DEBUG = False
+RANDOM = False
+p_threshold = 0.06
+early_stopping = False
+
+def get_contig_length(walk, graph):
+    total_length = 0
+    idx_src = walk[:-1]
+    idx_dst = walk[1:]
+    prefix = graph.edges[idx_src, idx_dst].data['prefix_length']
+    total_length = prefix.sum().item()
+    total_length += graph.ndata['read_length'][walk[-1]]
+    return total_length
+
+
+def get_subgraph(g, visited, device):
+    """Remove the visited nodes from the graph."""
+    remove_node_idx = torch.LongTensor([item for item in visited])
+    list_node_idx = torch.arange(g.num_nodes())
+    keep_node_idx = torch.ones(g.num_nodes())
+    keep_node_idx[remove_node_idx] = 0
+    keep_node_idx = list_node_idx[keep_node_idx==1].int().to(device)
+
+    sub_g = dgl.node_subgraph(g, keep_node_idx, store_ids=True)
+    sub_g.ndata['idx_nodes'] = torch.arange(sub_g.num_nodes()).to(device)
+    map_subg_to_g = sub_g.ndata[dgl.NID]
+    return sub_g, map_subg_to_g
+
+
+def sample_edges(prob_edges, nb_paths):
+    """Sample edges with Bernoulli sampling."""
+    if prob_edges.shape[0] > 2**24:
+        prob_edges = prob_edges[:2**24]  # torch.distributions.categorical.Categorical does not support tensors longer than 2**24
+        
+    if RANDOM:
+        idx_edges = torch.randint(0, prob_edges.shape[0], (nb_paths,))
+        return idx_edges
+    
+    prob_edges = prob_edges.masked_fill(prob_edges<1e-9, 1e-9)
+    prob_edges = prob_edges/ prob_edges.sum()
+    prob_edges_nb_paths = prob_edges.repeat(nb_paths, 1)
+    idx_edges = torch.distributions.categorical.Categorical(prob_edges_nb_paths).sample()
+    return idx_edges
+
+
+def greedy_forwards(start, logProbs, neighbors, predecessors, edges, visited_old):
+    """Greedy walk forwards."""
+    current = start
+    walk = []
+    visited = set()
+    sumLogProb = torch.tensor([0.0])
+    iteration = 0
+    while True:
+        walk.append(current)
+        visited.add(current)
+        visited.add(current ^ 1)
+        neighs_current = neighbors[current]
+        if len(neighs_current) == 0:
+            break 
+        if len(neighs_current) == 1:
+            neighbor = neighs_current[0]
+            if neighbor in visited_old or neighbor in visited:
+                break
+            else:
+                sumLogProb += logProbs[edges[current, neighbor]]
+                current = neighbor
+                continue
+        masked_neighbors = [n for n in neighs_current if not (n in visited_old or n in visited)]
+        neighbor_edges = [edges[current, n] for n in masked_neighbors]
+        if not neighbor_edges:
+            break
+        neighbor_p = logProbs[neighbor_edges]
+
+        if early_stopping:
+            if (neighbor_p < math.log(p_threshold)).all().item():
+                return walk, visited, sumLogProb
+
+        if RANDOM:
+            index = torch.randint(0, neighbor_p.shape[0], (1,))
+            logProb = neighbor_p[index]
+        else:
+            logProb, index = torch.topk(neighbor_p, k=1, dim=0)
+
+        sumLogProb += logProb
+        iteration += 1
+        current = masked_neighbors[index]
+    return walk, visited, sumLogProb
+
+
+def greedy_backwards_rc(start, logProbs, predecessors, neighbors, edges, visited_old):
+    """Greedy walk backwards."""
+    current = start ^ 1
+    walk = []
+    visited = set()
+    sumLogProb = torch.tensor([0.0])
+    iteration = 0
+    while True:
+        walk.append(current)
+        visited.add(current)
+        visited.add(current ^ 1)
+        neighs_current = neighbors[current]
+        if len(neighs_current) == 0:
+            break 
+        if len(neighs_current) == 1:
+            neighbor = neighs_current[0]
+            if neighbor in visited_old or neighbor in visited:
+                break
+            else:
+                sumLogProb += logProbs[edges[current, neighbor]]
+                current = neighbor
+                continue
+        masked_neighbors = [n for n in neighs_current if not (n in visited_old or n in visited)]
+        neighbor_edges = [edges[current, n] for n in masked_neighbors]
+        if not neighbor_edges:
+            break
+        neighbor_p = logProbs[neighbor_edges]
+
+        if early_stopping:
+            if (neighbor_p < math.log(p_threshold)).all().item():
+                walk = list(reversed([w ^ 1 for w in walk]))
+                return walk, visited, sumLogProb
+
+        if RANDOM:
+            index = torch.randint(0, neighbor_p.shape[0], (1,))
+            logProb = neighbor_p[index]
+        else:
+            logProb, index = torch.topk(neighbor_p, k=1, dim=0)
+
+        sumLogProb += logProb
+        iteration += 1
+        current = masked_neighbors[index]
+    walk = list(reversed([w ^ 1 for w in walk]))
+    return walk, visited, sumLogProb
+    
+
+def run_greedy_both_ways(src, dst, logProbs, succs, preds, edges, visited):
+    tmp_visited = visited | {src, src ^ 1, dst, dst ^ 1}
+    walk_f, visited_f, sumLogProb_f = greedy_forwards(dst, logProbs, succs, preds, edges, tmp_visited)
+    walk_b, visited_b, sumLogProb_b = greedy_backwards_rc(src, logProbs, preds, succs, edges, tmp_visited | visited_f)
+    return walk_f, walk_b, visited_f, visited_b, sumLogProb_f, sumLogProb_b
+
+
+def get_contigs_greedy(g, succs, preds, edges, len_threshold, nb_paths=50, use_labels=False, checkpoint_dir=None, load_checkpoint=False):
+    """Iteratively search for contigs in a graph until the threshold is met."""
+    g = g.to('cpu')
+    all_contigs = []
+    all_walks_len = []
+    all_contigs_len = []
+    visited = set()
+    idx_contig = -1
+
+    B = 1
+
+    if use_labels:
+        scores = g.edata['y'].to('cpu')
+        scores = scores.masked_fill(scores<1e-9, 1e-9)
+        logProbs = torch.log(scores)
+    else:
+        scores = g.edata['score'].to('cpu')
+        logProbs = torch.log(torch.sigmoid(g.edata['score'].to('cpu')))
+
+    print(f'Starting to decode with greedy...')
+    print(f'num_candidates: {nb_paths}\n')
+
+    ckpt_file = os.path.join(checkpoint_dir, 'checkpoint.pkl')
+    if load_checkpoint and os.path.isfile(ckpt_file):
+        print(f'Loading checkpoint from: {checkpoint_dir}\n')
+        checkpoint = pickle.load(open(f'{checkpoint_dir}/checkpoint.pkl', 'rb'))
+        all_contigs = checkpoint['walks']
+        visited = checkpoint['visited']
+        idx_contig = len(all_contigs) - 1
+        all_walks_len = checkpoint['all_walks_len']
+        all_contigs_len = checkpoint['all_contigs_len']
+
+    while True:
+        idx_contig += 1       
+        time_start_sample_edges = datetime.now()
+        sub_g, map_subg_to_g = get_subgraph(g, visited, 'cpu')
+        if sub_g.num_edges() == 0:
+            print(f'No edges left in the subgraph. Stopping...')
+            break
+        
+        if use_labels:  # Debugging
+            prob_edges = sub_g.edata['y']
+        else:
+            prob_edges = torch.sigmoid(sub_g.edata['score']).squeeze()
+
+        idx_edges = sample_edges(prob_edges, nb_paths)
+
+        elapsed = utils.timedelta_to_str(datetime.now() - time_start_sample_edges)
+        print(f'Elapsed time (sample edges): {elapsed}')
+
+        all_walks = []
+        all_visited_iter = []
+
+        all_contig_lens = []
+        all_sumLogProbs = []
+        all_meanLogProbs = []
+        all_meanLogProbs_scaled = []
+
+        print(f'\nidx_contig: {idx_contig}, nb_processed_nodes: {len(visited)}, ' \
+              f'nb_remaining_nodes: {g.num_nodes() - len(visited)}, nb_original_nodes: {g.num_nodes()}')
+
+        # Get nb_paths paths for a single iteration, then take the longest one
+        time_start_get_candidates = datetime.now()
+
+        with ThreadPoolExecutor(1) as executor:
+            if DEBUG:
+                print(f'Starting with greedy for one candidate', flush=True)
+                all_cand_time = datetime.now()
+            results = {}
+            start_times = {}
+            for e, idx in enumerate(idx_edges):
+                src_init_edges = map_subg_to_g[sub_g.edges()[0][idx]].item()
+                dst_init_edges = map_subg_to_g[sub_g.edges()[1][idx]].item()
+                start_times[e] = datetime.now()
+                if DEBUG:
+                    print(f'About to submit job - decoding from edge {e}: {src_init_edges, dst_init_edges}', flush=True)
+                future = executor.submit(run_greedy_both_ways, src_init_edges, dst_init_edges, logProbs, succs, preds, edges, visited)
+                results[(src_init_edges, dst_init_edges)] = (future, e)
+
+            if DEBUG:
+                process = psutil.Process(os.getpid())
+                children = process.children(recursive=True)
+                print(f'Processes ran: {e+1}\n' \
+                      f'Time needed: {utils.timedelta_to_str(datetime.now() - all_cand_time)}\n' \
+                      f'Current process ID: {os.getpid()}\n' \
+                      f'Total memory used (MB): {process.memory_info().rss / 1024 ** 2}', flush=True)
+                if len(children) == 0:
+                    print(f'Process has no children!')
+                for child in children:
+                    print(f'Child pid is {child.pid}', flush=True)
+                print()
+
+            indx = 0
+            for k, (f, e) in results.items():  # key, future -> Why did I not name this properly?
+                walk_f, walk_b, visited_f, visited_b, sumLogProb_f, sumLogProb_b = f.result()
+                if DEBUG:
+                    print(f'Finished with candidate {e}: {k}\t' \
+                        f'Time needed: {utils.timedelta_to_str(datetime.now() - start_times[e])}')         
+                walk_it = walk_b + walk_f
+                visited_iter = visited_f | visited_b
+                sumLogProb_it = sumLogProb_f.item() + sumLogProb_b.item()
+                len_walk_it = len(walk_it)
+                len_contig_it = get_contig_length(walk_it, g).item()
+
+                if k[0] == k[1]:
+                    len_walk_it = 1
+                if len_walk_it > 2:
+                    meanLogProb_it = sumLogProb_it / (len_walk_it - 2)  # len(walk_f) - 1 + len(walk_b) - 1  <-> starting edge is neglected
+                    try:
+                        meanLogProb_scaled_it = meanLogProb_it / math.sqrt(len_contig_it)
+                    except ValueError:
+                        print(f'{indx:<3}: src={k[0]:<8} dst={k[1]:<8} len_walk={len_walk_it:<8} len_contig={len_contig_it:<12}')
+                        print(f'Value error: something is wrong here!')
+                        meanLogProb_scaled_it = 0
+                elif len_walk_it == 2:
+                    meanLogProb_it = 0.0
+                    try:
+                        meanLogProb_scaled_it = meanLogProb_it / math.sqrt(len_contig_it)
+                    except ValueError:
+                        print(f'{indx:<3}: src={k[0]:<8} dst={k[1]:<8} len_walk={len_walk_it:<8} len_contig={len_contig_it:<12}')
+                        print(f'Value error: something is wrong here!')
+                        meanLogProb_scaled_it = 0
+                else:  # len_walk_it == 1 <-> SELF-LOOP!
+                    len_contig_it = 0
+                    sumLogProb_it = 0.0
+                    meanLogProb_it = 0.0
+                    meanLogprob_scaled_it = 0.0
+                    print(f'SELF-LOOP!')
+                print(f'{indx:<3}: src={k[0]:<8} dst={k[1]:<8} len_walk={len_walk_it:<8} len_contig={len_contig_it:<12} ' \
+                      f'sumLogProb={sumLogProb_it:<12.3f} meanLogProb={meanLogProb_it:<12.4} meanLogProb_scaled={meanLogProb_scaled_it:<12.4}')
+
+                indx += 1
+                all_walks.append(walk_it)
+                all_visited_iter.append(visited_iter)
+                all_contig_lens.append(len_contig_it)
+                all_sumLogProbs.append(sumLogProb_it)
+                all_meanLogProbs.append(meanLogProb_it)
+                all_meanLogProbs_scaled.append(meanLogProb_scaled_it)
+
+        best = max(all_contig_lens)
+        idxx = all_contig_lens.index(best)
+
+        elapsed = utils.timedelta_to_str(datetime.now() - time_start_get_candidates)
+        print(f'Elapsed time (get_candidates): {elapsed}')
+
+        best_walk = all_walks[idxx]
+        best_visited = all_visited_iter[idxx]
+
+        # Add all jumped-over nodes
+        time_start_get_visited = datetime.now()
+        trans = set()
+        for ss, dd in zip(best_walk[:-1], best_walk[1:]):
+            t1 = set(succs[ss]) & set(preds[dd])
+            t2 = {t^1 for t in t1}
+            trans = trans | t1 | t2
+        best_visited = best_visited | trans
+
+        best_contig_len = all_contig_lens[idxx]
+        best_sumLogProb = all_sumLogProbs[idxx]
+        best_meanLogProb = all_meanLogProbs[idxx]
+        best_meanLogProb_scaled = all_meanLogProbs_scaled[idxx]
+
+        elapsed = utils.timedelta_to_str(datetime.now() - time_start_get_visited)
+        print(f'Elapsed time (get visited): {elapsed}')
+
+        print(f'\nChosen walk with index: {idxx}')
+        print(f'len_walk={len(best_walk):<8} len_contig={best_contig_len:<12} ' \
+              f'sumLogProb={best_sumLogProb:<12.3f} meanLogProb={best_meanLogProb:<12.4} meanLogProb_scaled={best_meanLogProb_scaled:<12.4}\n')
+        
+        if best_contig_len < len_threshold:
+            break
+
+        all_contigs.append(best_walk)
+        visited |= best_visited
+        all_walks_len.append(len(best_walk))
+        all_contigs_len.append(best_contig_len)
+        print(f'All walks len: {all_walks_len}')
+        print(f'All contigs len: {all_contigs_len}\n')
+
+        if len(all_contigs) % 10 == 0:
+            checkpoint = {
+                'walks': all_contigs,
+                'visited': visited,
+                'all_walks_len': all_walks_len,
+                'all_contigs_len': all_contigs_len
+            }
+            if not DEBUG:
+                try:
+                    pickle.dump(checkpoint, open(f'{checkpoint_dir}/checkpoint_tmp.pkl', 'wb'))
+                    os.rename(f'{checkpoint_dir}/checkpoint_tmp.pkl', f'{checkpoint_dir}/checkpoint.pkl')
+                except OSError:
+                    print(f'Checkpoint was not saved. Last available checkopint: {checkpoint_dir}/checkpoint.pkl')
+                    raise
+
+    return all_contigs
+
+
+def inference(data_path, model_path, assembler, savedir, device='cpu', dropout=None):
+    """Using a pretrained model, get walks and contigs on new data."""
+    hyperparameters = get_hyperparameters()
+    seed = hyperparameters['seed']
+    num_gnn_layers = hyperparameters['num_gnn_layers']
+    hidden_features = hyperparameters['dim_latent']
+
+    normalization = hyperparameters['normalization']
+    node_features = hyperparameters['node_features']
+    edge_features = hyperparameters['edge_features']
+    hidden_ne_features = hyperparameters['hidden_ne_features']
+    hidden_edge_scores = hyperparameters['hidden_edge_scores']
+
+    strategy = hyperparameters['strategy']
+    B = hyperparameters['B']
+    nb_paths = hyperparameters['num_decoding_paths']
+    len_threshold = hyperparameters['len_threshold']
+    use_labels = hyperparameters['decode_with_labels']
+    load_checkpoint = hyperparameters['load_checkpoint']
+
+    # random_search = hyperparameters['random_search']
+
+    # assembly_path = hyperparameters['asms_path']
+
+    device = 'cpu'  # Hardcode, because we cannot do inference on a GPU - usually not enough memory to load the whole graph
+    utils.set_seed(seed)
+    time_start = datetime.now()
+
+    ds = AssemblyGraphDataset(data_path, assembler)
+
+    inference_dir = os.path.join(savedir, 'decode')
+    if not os.path.isdir(inference_dir):
+        os.makedirs(inference_dir)
+
+    checkpoint_dir = os.path.join(savedir, 'checkpoint')
+    if not os.path.isdir(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    walks_per_graph = []
+    contigs_per_graph = []
+
+    elapsed = utils.timedelta_to_str(datetime.now() - time_start)
+    print(f'\nelapsed time (loading network and data): {elapsed}\n')
+
+    for idx, g in ds:
+        # Get scores
+        print(f'==== Processing graph {idx} ====')
+        with torch.no_grad():
+            time_start_get_scores = datetime.now()
+            g = g.to(device)
+            x = g.ndata['x'].to(device)
+            e = g.edata['e'].to(device)
+            pe_in = g.ndata['in_deg'].unsqueeze(1).to(device)
+            pe_in = (pe_in - pe_in.mean()) / pe_in.std()
+            pe_out = g.ndata['out_deg'].unsqueeze(1).to(device)
+            pe_out = (pe_out - pe_out.mean()) / pe_out.std()
+            x = torch.cat((pe_in, pe_out), dim=1)  # No PageRank
+            
+            if use_labels:  # Debugging
+                print('Decoding with labels...')
+                g.edata['score'] = g.edata['y'].clone()
+            else:
+                print('Decoding with model scores...')
+                predicts_path = os.path.join(inference_dir, f'{idx}_predicts.pt')
+                if os.path.isfile(predicts_path):
+                    print(f'Loading the scores from:\n{predicts_path}\n')
+                    g.edata['score'] = torch.load(predicts_path)
+                elif RANDOM:
+                    g.edata['score'] = torch.ones_like(g.edata['prefix_length']) * 10
+                else:
+                    print(f'Loading model parameters from: {model_path}')
+                    model = models.SymGatedGCNModel(node_features, edge_features, hidden_features, hidden_ne_features, num_gnn_layers, hidden_edge_scores, normalization, dropout=dropout)
+                    model.load_state_dict(torch.load(model_path, map_location=torch.device(device)))
+                    model.eval()
+                    model.to(device)
+                    print(f'Computing the scores with the model...\n')
+                    edge_predictions = model(g, x, e)
+                    g.edata['score'] = edge_predictions.squeeze()
+                    torch.save(g.edata['score'], os.path.join(inference_dir, f'{idx}_predicts.pt'))
+
+            elapsed = utils.timedelta_to_str(datetime.now() - time_start_get_scores)
+            print(f'elapsed time (get_scores): {elapsed}')
+
+        # Load info data
+        print(f'Loading successors...')
+        with open(f'{data_path}/{assembler}/info/{idx}_succ.pkl', 'rb') as f_succs:
+            succs = pickle.load(f_succs)
+        print(f'Loading predecessors...')
+        with open(f'{data_path}/{assembler}/info/{idx}_pred.pkl', 'rb') as f_preds:
+            preds = pickle.load(f_preds)
+        print(f'Loading edges...')
+        with open(f'{data_path}/{assembler}/info/{idx}_edges.pkl', 'rb') as f_edges:
+            edges = pickle.load(f_edges)
+        print(f'Done loading the auxiliary graph data!')
+
+        # Get walks
+        time_start_get_walks = datetime.now()
+        
+        # Some prefixes can be <0 and that messes up the assemblies
+        g.edata['prefix_length'] = g.edata['prefix_length'].masked_fill(g.edata['prefix_length']<0, 0)
+        
+        if strategy == 'greedy':
+            walks = get_contigs_greedy(g, succs, preds, edges, len_threshold, nb_paths, use_labels, checkpoint_dir, load_checkpoint)
+        else:
+            print('Invalid decoding strategy')
+            raise Exception
+ 
+        elapsed = utils.timedelta_to_str(datetime.now() - time_start_get_walks)
+        print(f'elapsed time (get_walks): {elapsed}')
+        inference_path = os.path.join(inference_dir, f'{idx}_walks.pkl')
+        pickle.dump(walks, open(f'{inference_path}', 'wb'))
+
+        print(f'Loading reads...')
+        with open(f'{data_path}/{assembler}/info/{idx}_reads.pkl', 'rb') as f_reads:
+            reads = pickle.load(f_reads)
+        print(f'Done!')
+        
+        time_start_get_contigs = datetime.now()
+        contigs = evaluate.walk_to_sequence(walks, g, reads, edges)
+        elapsed = utils.timedelta_to_str(datetime.now() - time_start_get_contigs)
+        print(f'elapsed time (get_contigs): {elapsed}')
+
+        assembly_dir = os.path.join(savedir, f'assembly')
+        if not os.path.isdir(assembly_dir):
+            os.makedirs(assembly_dir)
+        evaluate.save_assembly(contigs, assembly_dir, idx)
+        walks_per_graph.append(walks)
+        contigs_per_graph.append(contigs)
+
+    elapsed = utils.timedelta_to_str(datetime.now() - time_start)
+    print(f'elapsed time (total): {elapsed}')
+    
+    if DEBUG:
+        exit(0)
+
+    print(f'Found contigs for {data_path}!')
+    print(f'Model used: {model_path}')
+    print(f'Assembly saved in: {savedir}')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, help='Path to the dataset')
+    parser.add_argument('--asm', type=str, help='Assembler used')
+    parser.add_argument('--out', type=str, help='Output directory')
+    parser.add_argument('--model', type=str, default=None, help='Path to the model')
+    args = parser.parse_args()
+
+    data = args.data
+    asm = args.asm
+    out = args.out
+    model = args.model
+    if not model:
+        model = 'weights/weights.pt'
+
+    inference(data_path=data, assembler=asm, model_path=model, savedir=out)
+    args = parser.parse_args()
+
+
